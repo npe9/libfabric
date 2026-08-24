@@ -91,18 +91,67 @@ static struct ofi_mr_entry *util_mr_entry_alloc(struct ofi_mr_cache *cache)
 {
 	struct ofi_mr_entry *entry;
 
+#if HAVE_LITHE
+	/* Initialize mutex if not already initialized - must be in scheduler context */
+	lithe_sched_t *current_sched = lithe_sched_current();
+	if (current_sched != NULL && current_sched->parent != NULL) {
+		/* We're in a non-base scheduler - safe to initialize and use mutex */
+		/* DELETED: lazy re-initialisation of cache->lock.
+		 *
+		 * It read `*(volatile void**)&cache->lock` as an "is it initialised?"
+		 * test, but the first 8 bytes of lithe_mutex_t are
+		 * `lithe_mutexattr_t attr` (an int `type` plus padding), NOT a
+		 * pointer. For the default attr, type == 0, so the test read as NULL
+		 * on EVERY call -- including while the mutex was HELD -- and called
+		 * lithe_mutex_init on a live lock. That does TAILQ_INIT (drops queued
+		 * waiters), mcs_pdr_init (zeroes the MCS tail) and clears
+		 * locked/owner, so the holder's later lithe_mutex_unlock saw
+		 * old_tail == NULL and spun forever in the MCS successor-link loop.
+		 *
+		 * Measured: that spin is where wedged NX>=40 miniFE ranks were pinned
+		 * (29/30 IP samples), with concurrent_unlockers == 1 proving a third
+		 * party had wiped the lock; and FI_MR_CACHE_MAX_COUNT=0, which skips
+		 * this whole path, took NX64 from 0/9 to 8/8 completions.
+		 *
+		 * No lazy init is needed: ofi_mr_cache_init() already does
+		 * lithe_mutex_init(&cache->lock, &attr) at cache creation. */
+		lithe_mutex_lock(&cache->lock);
+		entry = ofi_buf_alloc(cache->entry_pool);
+		lithe_mutex_unlock(&cache->lock);
+	} else {
+		/* Not in scheduler or in base scheduler - can't use mutex */
+		/* Just allocate without locking (single-threaded during init/cleanup) */
+		entry = ofi_buf_alloc(cache->entry_pool);
+	}
+#else
 	pthread_mutex_lock(&cache->lock);
 	entry = ofi_buf_alloc(cache->entry_pool);
 	pthread_mutex_unlock(&cache->lock);
+#endif
 	return entry;
 }
 
 static void util_mr_entry_free(struct ofi_mr_cache *cache,
 			       struct ofi_mr_entry *entry)
 {
+#if HAVE_LITHE
+	/* Use mutex if we're in a scheduler context */
+	lithe_sched_t *current_sched = lithe_sched_current();
+	if (current_sched != NULL && current_sched->parent != NULL) {
+		/* We're in a non-base scheduler - safe to use mutex */
+		lithe_mutex_lock(&cache->lock);
+		ofi_buf_free(entry);
+		lithe_mutex_unlock(&cache->lock);
+	} else {
+		/* Not in scheduler or in base scheduler - can't use mutex */
+		/* Just free without locking (single-threaded during init/cleanup) */
+		ofi_buf_free(entry);
+	}
+#else
 	pthread_mutex_lock(&cache->lock);
 	ofi_buf_free(entry);
 	pthread_mutex_unlock(&cache->lock);
+#endif
 }
 
 /* We cannot hold the monitor lock when freeing an entry.  This call
@@ -207,9 +256,26 @@ bool ofi_mr_cache_flush(struct ofi_mr_cache *cache, bool flush_lru)
 	struct ofi_mr_entry *entry;
 	bool entries_freed;
 
+#if HAVE_LITHE
+	/* Check cleanup flag FIRST - if cleanup is in progress, skip locking */
+	extern volatile int ofi_cleanup_in_progress;
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return false;
+	}
+	/* Check scheduler - if in base scheduler, skip locking */
+	lithe_sched_t *current_sched = lithe_sched_current();
+	if (current_sched == NULL || current_sched->parent == NULL) {
+		return false;
+	}
+#endif
+
 	dlist_init(&free_list);
 
+#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
 	pthread_mutex_lock(&mm_lock);
+#endif
 
 	dlist_splice_tail(&free_list, &cache->dead_region_list);
 
@@ -223,7 +289,11 @@ bool ofi_mr_cache_flush(struct ofi_mr_cache *cache, bool flush_lru)
 		flush_lru = ofi_mr_cache_full(cache);
 	}
 
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 
 	entries_freed = !dlist_empty(&free_list);
 
@@ -243,20 +313,32 @@ void ofi_mr_cache_delete(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry)
 	FI_DBG(cache->prov, FI_LOG_MR, "delete %p (len: %zu)\n",
 	       entry->info.iov.iov_base, entry->info.iov.iov_len);
 
+#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
 	pthread_mutex_lock(&mm_lock);
+#endif
 	cache->delete_cnt++;
 
 	if (--entry->use_cnt == 0) {
 		if (!entry->node) {
 			cache->uncached_cnt--;
 			cache->uncached_size -= entry->info.iov.iov_len;
-			pthread_mutex_unlock(&mm_lock);
+		#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
+	pthread_mutex_unlock(&mm_lock);
+#endif
 			util_mr_free_entry(cache, entry);
 			return;
 		}
 		dlist_insert_tail(&entry->list_entry, &cache->lru_list);
 	}
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 }
 
 /*
@@ -300,7 +382,11 @@ util_mr_cache_create(struct ofi_mr_cache *cache, struct ofi_mr_info *info,
 	assert(ofi_iov_within(&(*info).iov, &(*entry)->info.iov));
 	*info = (*entry)->info;
 
+#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
 	pthread_mutex_lock(&mm_lock);
+#endif
 	cur = ofi_mr_rbt_find(&cache->tree, info);
 	if (cur) {
 		ret = -FI_EAGAIN;
@@ -328,11 +414,19 @@ util_mr_cache_create(struct ofi_mr_cache *cache, struct ofi_mr_info *info,
 			cache->uncached_size += (*entry)->info.iov.iov_len;
 		}
 	}
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 	return 0;
 
 unlock:
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 free:
 	util_mr_free_entry(cache, *entry);
 	return ret;
@@ -357,12 +451,24 @@ int ofi_mr_cache_search(struct ofi_mr_cache *cache, struct ofi_mr_info *info,
 	       info->iov.iov_base, info->iov.iov_len);
 
 	do {
-		pthread_mutex_lock(&mm_lock);
+	#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
+	pthread_mutex_lock(&mm_lock);
+#endif
 		flush_lru = ofi_mr_cache_full(cache);
 		if (flush_lru || !dlist_empty(&cache->dead_region_list)) {
-			pthread_mutex_unlock(&mm_lock);
+		#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
+	pthread_mutex_unlock(&mm_lock);
+#endif
 			ofi_mr_cache_flush(cache, flush_lru);
-			pthread_mutex_lock(&mm_lock);
+		#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
+	pthread_mutex_lock(&mm_lock);
+#endif
 		}
 
 		cache->search_cnt++;
@@ -378,7 +484,11 @@ int ofi_mr_cache_search(struct ofi_mr_cache *cache, struct ofi_mr_info *info,
 			util_mr_uncache_entry(cache, *entry);
 			*entry = ofi_mr_rbt_find(&cache->tree, info);
 		}
-		pthread_mutex_unlock(&mm_lock);
+	#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
+	pthread_mutex_unlock(&mm_lock);
+#endif
 
 		ret = util_mr_cache_create(cache, info, entry);
 		if (ret && ret != -FI_EAGAIN) {
@@ -393,7 +503,11 @@ hit:
 	cache->hit_cnt++;
 	if ((*entry)->use_cnt++ == 0)
 		dlist_remove_init(&(*entry)->list_entry);
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 	return 0;
 }
 
@@ -409,12 +523,24 @@ struct ofi_mr_entry *ofi_mr_cache_find(struct ofi_mr_cache *cache,
 	FI_DBG(cache->prov, FI_LOG_MR, "find %p (len: %zu)\n",
 	       attr->mr_iov->iov_base, attr->mr_iov->iov_len);
 
+#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
 	pthread_mutex_lock(&mm_lock);
+#endif
 
 	if (!dlist_empty(&cache->dead_region_list)) {
-		pthread_mutex_unlock(&mm_lock);
+	#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
+	pthread_mutex_unlock(&mm_lock);
+#endif
 		ofi_mr_cache_flush(cache, false);
-		pthread_mutex_lock(&mm_lock);
+	#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
+	pthread_mutex_lock(&mm_lock);
+#endif
 	}
 
 	cache->search_cnt++;
@@ -441,7 +567,11 @@ struct ofi_mr_entry *ofi_mr_cache_find(struct ofi_mr_cache *cache,
 	}
 
 unlock:
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 	return entry;
 }
 
@@ -458,10 +588,18 @@ int ofi_mr_cache_reg(struct ofi_mr_cache *cache, const struct fi_mr_attr *attr,
 	if (!*entry)
 		return -FI_ENOMEM;
 
+#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
 	pthread_mutex_lock(&mm_lock);
+#endif
 	cache->uncached_cnt++;
 	cache->uncached_size += attr->mr_iov->iov_len;
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 
 	ofi_mr_info_get_iov_from_mr_attr(&(*entry)->info, attr, flags);
 	(*entry)->use_cnt = 1;
@@ -475,10 +613,18 @@ int ofi_mr_cache_reg(struct ofi_mr_cache *cache, const struct fi_mr_attr *attr,
 
 buf_free:
 	util_mr_entry_free(cache, *entry);
+#if HAVE_LITHE
+	ofi_mm_lock_lock();
+#else
 	pthread_mutex_lock(&mm_lock);
+#endif
 	cache->uncached_cnt--;
 	cache->uncached_size -= attr->mr_iov->iov_len;
+#if HAVE_LITHE
+	ofi_mm_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_lock);
+#endif
 	return ret;
 }
 
@@ -488,6 +634,35 @@ void ofi_mr_cache_cleanup(struct ofi_mr_cache *cache)
 	if (!cache->prov)
 		return;
 
+#if HAVE_LITHE
+	/* CRITICAL (lithified OFI): deterministically stop the memory-monitor
+	 * eviction context BEFORE tearing down the cache tree.
+	 *
+	 * The kdreg2 (and uffd/memhooks) evictor is a Lithe context that walks
+	 * and mutates the MR-cache red-black tree (ofi_rbmap) on mapping-change
+	 * events. If we free the tree while it is alive, later frees during
+	 * finalize (e.g. yaksa/typerep teardown, dlclose) raise mapping-change
+	 * events that the evictor processes against freed rbmap nodes -> it
+	 * dereferences a freed node in util_mr_find_overlap / ofi_rbmap_delete.
+	 * At VCORE_LIMIT>=2 this is a use-after-free segfault; at VCORE_LIMIT=1
+	 * the still-live context starves finalize (hang).
+	 *
+	 * The stock ofi_monitors_del_cache() cannot be used here: by finalize
+	 * time ofi_cleanup_in_progress is already set (libfabric's atexit /
+	 * fabric fini), which makes it early-return and makes every ofi_mm_*
+	 * lock a no-op -- so the evictor would be left linked and unserialized.
+	 * ofi_monitors_del_cache_lithe() instead delists this cache and stops
+	 * (cooperatively joins) any now-idle evictor using the REAL Lithe mm
+	 * locks, independent of that flag, while the scheduler is still active. */
+	ofi_monitors_del_cache_lithe(cache);
+
+	/* Evictor stopped and cache delisted: no other context can touch the
+	 * cache now. Mark cleanup so the remaining single-threaded teardown
+	 * skips Lithe-mutex use safely (base-scheduler-safe). */
+	extern volatile int ofi_cleanup_in_progress;
+	__atomic_store_n(&ofi_cleanup_in_progress, 1, __ATOMIC_RELEASE);
+#endif
+
 	FI_INFO(cache->prov, FI_LOG_MR, "MR cache stats: "
 		"searches %zu, deletes %zu, hits %zu notify %zu\n",
 		cache->search_cnt, cache->delete_cnt, cache->hit_cnt,
@@ -496,8 +671,13 @@ void ofi_mr_cache_cleanup(struct ofi_mr_cache *cache)
 	while (ofi_mr_cache_flush(cache, true))
 		;
 
+#if HAVE_LITHE
+	/* Lithe mutexes don't need explicit destruction; the monitor/evictor
+	 * was already stopped above before the flag was set. */
+#else
 	pthread_mutex_destroy(&cache->lock);
 	ofi_monitors_del_cache(cache);
+#endif
 	ofi_rbmap_cleanup(&cache->tree);
 	if (cache->domain)
 		ofi_atomic_dec32(&cache->domain->ref);
@@ -513,13 +693,32 @@ int ofi_mr_cache_init(struct util_domain *domain,
 		      struct ofi_mem_monitor **monitors,
 		      struct ofi_mr_cache *cache)
 {
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Starting\n");
+		fflush(stderr);
+	}
 	int ret;
 
 	assert(cache->add_region && cache->delete_region);
 	if (!cache_params.max_cnt || !cache_params.max_size)
 		return -FI_ENOSPC;
 
+#if HAVE_LITHE
+	/* Initialize Lithe mutex directly - scheduler should be active by now */
+	lithe_mutexattr_t attr;
+	lithe_mutexattr_init(&attr);
+	lithe_mutex_init(&cache->lock, &attr);
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Initialized Lithe mutex\n");
+		fflush(stderr);
+	}
+#else
 	pthread_mutex_init(&cache->lock, NULL);
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Initialized pthread_mutex\n");
+		fflush(stderr);
+	}
+#endif
 	dlist_init(&cache->lru_list);
 	dlist_init(&cache->dead_region_list);
 	cache->cached_cnt = 0;
@@ -540,15 +739,35 @@ int ofi_mr_cache_init(struct util_domain *domain,
 		cache->prov = (const struct fi_provider *) &core_prov;
 	}
 
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Initializing rbmap\n");
+		fflush(stderr);
+	}
 	ofi_rbmap_init(&cache->tree, util_mr_find_within);
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Calling ofi_monitors_add_cache\n");
+		fflush(stderr);
+	}
 	ret = ofi_monitors_add_cache(monitors, cache);
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Returned from ofi_monitors_add_cache, ret=%d\n", ret);
+		fflush(stderr);
+	}
 	if (ret)
 		goto destroy;
 
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Calling ofi_bufpool_create\n");
+		fflush(stderr);
+	}
 	ret = ofi_bufpool_create(&cache->entry_pool,
 				 sizeof(struct ofi_mr_entry) +
 				 cache->entry_data_size,
 				 16, 0, 0, 0);
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_mr_cache_init: Returned from ofi_bufpool_create, ret=%d\n", ret);
+		fflush(stderr);
+	}
 	if (ret)
 		goto del;
 
@@ -561,7 +780,11 @@ destroy:
 		ofi_atomic_dec32(&cache->domain->ref);
 		cache->domain = NULL;
 	}
+#if HAVE_LITHE
+	/* Lithe mutexes don't need explicit destruction */
+#else
 	pthread_mutex_destroy(&cache->lock);
+#endif
 	cache->prov = NULL;
 	return ret;
 }
