@@ -76,12 +76,12 @@ int opx_tid_cache_flush(struct ofi_mr_cache *cache, const bool flush_lru)
 		return 0;
 	}
 
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
 
 	/* Flush dead list and possibly one lru entry */
 	int freed_entries = opx_tid_cache_flush_all(cache, flush_lru, false);
 
-	pthread_mutex_lock(&mm_lock);
+	ofi_mm_lock_lock();
 	return freed_entries;
 }
 

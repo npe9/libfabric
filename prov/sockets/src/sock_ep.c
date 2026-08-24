@@ -664,7 +664,7 @@ static int sock_ep_close(struct fid *fid)
 		ofi_mutex_unlock(&sock_ep->attr->av->list_lock);
 	}
 
-	pthread_mutex_lock(&sock_ep->attr->domain->pe->list_lock);
+	ofi_mutex_lock(&sock_ep->attr->domain->pe->list_lock);
 	if (sock_ep->attr->tx_shared) {
 		ofi_mutex_lock(&sock_ep->attr->tx_ctx->lock);
 		dlist_remove(&sock_ep->attr->tx_ctx_entry);
@@ -676,7 +676,7 @@ static int sock_ep_close(struct fid *fid)
 		dlist_remove(&sock_ep->attr->rx_ctx_entry);
 		ofi_mutex_unlock(&sock_ep->attr->rx_ctx->lock);
 	}
-	pthread_mutex_unlock(&sock_ep->attr->domain->pe->list_lock);
+	ofi_mutex_unlock(&sock_ep->attr->domain->pe->list_lock);
 
 	if (sock_ep->attr->conn_handle.do_listen) {
 		ofi_mutex_lock(&sock_ep->attr->domain->conn_listener.signal_lock);

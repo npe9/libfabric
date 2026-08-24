@@ -263,6 +263,24 @@ OFI_DEF_COMPLEX_OPS(float)
 OFI_DEF_COMPLEX_OPS(double)
 OFI_DEF_COMPLEX_OPS(long_double)
 
+#if HAVE_LITHE
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wnested-externs"
+#include <parlib/parlib.h>
+#include <lithe/lithe.h>
+#include <lithe/mutex.h>
+#include <lithe/condvar.h>
+#include <lithe/fork_join_sched.h>
+#pragma GCC diagnostic pop
+
+/* Thread creation using Lithe contexts instead of pthread_create */
+typedef struct {
+    lithe_fork_join_context_t *context;
+} ofi_thread_t;
+
+#endif /* HAVE_LITHE */
+
 #ifdef HAVE_ATOMICS
 #  include <stdatomic.h>
 
@@ -344,5 +362,21 @@ ofi_cpuid(unsigned func, unsigned subfunc, unsigned cpuinfo[4])
 #define ofi_sfence()
 
 #endif /* defined(__x86_64__) || defined(__amd64__) */
+
+#if HAVE_LITHE
+/* Initialize libfabric's Lithe scheduler - should be called from OpenMPI initialization */
+void ofi_init_lithe_scheduler(void);
+
+/* Ensure we're in the scheduler before using mutexes */
+/* This is called from other threads/contexts that might not be in the scheduler */
+void ofi_ensure_in_scheduler(void);
+
+/* Global flag to track cleanup state - set by atexit handler */
+extern volatile int ofi_cleanup_in_progress;
+
+int ofi_thread_create(ofi_thread_t *thread, void *(*start_routine)(void *), void *arg);
+int ofi_thread_join(ofi_thread_t *thread, void **retval);
+void ofi_thread_exit(void *retval);
+#endif
 
 #endif /* _FI_UNIX_OSD_H_ */

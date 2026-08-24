@@ -19,6 +19,10 @@
 #include <ofi_list.h>
 #include <ofi.h>
 
+#if HAVE_LITHE
+#include <lithe/lithe.h>
+#endif
+
 #include "cxip.h"
 
 #define CXIP_DBG(...) _CXIP_DBG(FI_LOG_CQ, __VA_ARGS__)
@@ -354,8 +358,14 @@ static ssize_t cxip_cq_sreadfrom(struct fid_cq *cq_fid, void *buf,
 
 		memset(&ev, 0, sizeof(ev));
 		ret = epoll_wait(cq->ep_fd, &ev, 1, timeout);
-		if (ret > 0)
+		if (ret > 0) {
 			ret = 0;
+			break; /* Got events, exit loop */
+		}
+
+		/* ret == 0 means timeout. In lithified builds, wrapped epoll_wait
+		 * parks the current continuation on parlib's scheduler-driven
+		 * reactor; retry so the CQ read observes completion or timeout. */
 
 	} while (!ret);
 

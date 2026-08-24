@@ -40,6 +40,9 @@
 #endif /* HAVE_CONFIG_H */
 
 #include <pthread.h>
+#if HAVE_LITHE
+#include <lithe/mutex.h>
+#endif
 #include <stdio.h>
 
 #include <rdma/fabric.h>
@@ -142,8 +145,13 @@ enum {
 };
 
 struct ofi_common_locks {
+#if HAVE_LITHE
+	lithe_mutex_t ini_lock;
+	lithe_mutex_t util_fabric_lock;
+#else
 	pthread_mutex_t ini_lock;
 	pthread_mutex_t util_fabric_lock;
+#endif
 };
 
 /*
@@ -1240,7 +1248,11 @@ typedef int(*ofi_ns_is_service_wildcard_func_t)(void *svc);
 
 struct util_ns {
 	SOCKET		listen_sock;
+#if HAVE_LITHE
+	ofi_thread_t	thread;
+#else
 	pthread_t	thread;
+#endif
 	RbtHandle	map;
 
 	char		*hostname;

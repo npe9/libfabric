@@ -1192,7 +1192,7 @@ amsh_ep_connreq_poll(ptl_t *ptl_gen, struct am_ptl_connection_req *req)
 		req->isdone = 1;
 		return PSM2_OK;
 	} else {
-		sched_yield();
+		yield();
 		return PSM2_OK_NO_PROGRESS;
 	}
 }
@@ -1563,7 +1563,7 @@ amsh_poll_internal_inner(ptl_t *ptl_gen, int replyonly,
 			ptl->zero_polls = 0;
 		else if (++ptl->zero_polls == AMSH_ZERO_POLLS_BEFORE_YIELD) {
 			/* no progress for AMSH_ZERO_POLLS_BEFORE_YIELD */
-			sched_yield();
+			yield();
 			ptl->zero_polls = 0;
 		}
 

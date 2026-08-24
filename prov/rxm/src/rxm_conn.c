@@ -861,7 +861,11 @@ void rxm_stop_listen(struct rxm_ep *ep)
 	int ret;
 
 	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL, "stopping CM thread\n");
+#if HAVE_LITHE
+	if (!ep->cm_thread.context)
+#else
 	if (!ep->cm_thread)
+#endif
 		return;
 
 	ofi_genlock_lock(&ep->util_ep.lock);
@@ -874,7 +878,11 @@ void rxm_stop_listen(struct rxm_ep *ep)
 		return;
 	}
 
+#if HAVE_LITHE
+	ret = ofi_thread_join(&ep->cm_thread, NULL);
+#else
 	ret = pthread_join(ep->cm_thread, NULL);
+#endif
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "pthread_join", -ret);
 	}
@@ -993,8 +1001,12 @@ int rxm_start_listen(struct rxm_ep *ep)
 	    force_auto_progress) {
 		assert(ep->util_ep.domain->threading == FI_THREAD_SAFE);
 		ep->do_progress = true;
-		ret = pthread_create(&ep->cm_thread, 0, rxm_cm_data_progress,
+	#if HAVE_LITHE
+	ret = ofi_thread_create(&ep->cm_thread, rxm_cm_data_progress, ep);
+#else
+	ret = pthread_create(&ep->cm_thread, 0, rxm_cm_data_progress,
 				     ep);
+#endif
 		if (ret) {
 			RXM_WARN_ERR(FI_LOG_EP_CTRL, "pthread_create", -ret);
 			return -ret;

@@ -121,7 +121,11 @@ struct usdf_fabric {
 	LIST_HEAD(,usdf_domain) fab_domain_list;
 
 	/* progression */
+#if HAVE_LITHE
+	ofi_thread_t fab_thread;
+#else
 	pthread_t fab_thread;
+#endif
 	int fab_exit;
 	ofi_epoll_t fab_epollfd;
 	int fab_eventfd;

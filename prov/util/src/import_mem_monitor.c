@@ -129,18 +129,26 @@ static void ofi_import_monitor_notify(struct fid_mem_monitor *monitor,
 				      const void *addr, size_t len)
 {
 	assert(monitor->fid.context == &impmon);
+#if HAVE_LITHE
+	ofi_mm_list_lock();
+#else
 	pthread_rwlock_rdlock(&mm_list_rwlock);
-	pthread_mutex_lock(&mm_lock);
+#endif
+	ofi_mm_lock_lock();
 	ofi_monitor_notify(&impmon.monitor, addr, len);
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
+#if HAVE_LITHE
+	ofi_mm_list_unlock();
+#else
 	pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
 }
 
 static int ofi_close_import(struct fid *fid)
 {
-	pthread_mutex_lock(&mm_state_lock);
+	ofi_mm_state_lock_lock();
 	impmon.monitor.state = FI_MM_STATE_IDLE;
-	pthread_mutex_unlock(&mm_state_lock);
+	ofi_mm_state_lock_unlock();
 	impmon.impfid = NULL;
 	return 0;
 }

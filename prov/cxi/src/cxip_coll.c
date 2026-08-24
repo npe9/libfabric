@@ -1355,7 +1355,7 @@ static int _coll_add_buffers(struct cxip_coll_pte *coll_pte, size_t size,
 	}
 	/* Block until PTE completes buffer appends */
 	do {
-		sched_yield();
+		cxip_yield();
 		cxip_evtq_progress(coll_pte->ep_obj->coll.rx_evtq, true);
 	} while (ofi_atomic_get32(&coll_pte->buf_cnt) < count);
 	coll_pte->buf_low_water = (int)count;

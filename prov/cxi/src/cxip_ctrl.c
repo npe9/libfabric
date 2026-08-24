@@ -224,7 +224,7 @@ int cxip_ctrl_msg_init(struct cxip_ep_obj *ep_obj)
 
 	/* Wait for link EQ event */
 	while (!(event = cxi_eq_get_event(ep_obj->ctrl.tgt_evtq)))
-		sched_yield();
+		cxip_yield();
 
 	if (event->hdr.event_type != C_EVENT_LINK ||
 	    event->tgt_long.buffer_id != ep_obj->ctrl.msg_req.req_id) {
@@ -607,7 +607,7 @@ int cxip_ep_ctrl_init(struct cxip_ep_obj *ep_obj)
 
 	/* Wait for Enable event */
 	while (!(event = cxi_eq_get_event(ep_obj->ctrl.tgt_evtq)))
-		sched_yield();
+		cxip_yield();
 
 	switch (event->hdr.event_type) {
 	case C_EVENT_STATE_CHANGE:

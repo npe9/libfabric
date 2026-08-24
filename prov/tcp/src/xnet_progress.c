@@ -1753,8 +1753,12 @@ int xnet_start_progress(struct xnet_progress *progress)
 	}
 
 	progress->auto_progress = true;
+#if HAVE_LITHE
+	ret = ofi_thread_create(&progress->thread, xnet_auto_progress, progress);
+#else
 	ret = pthread_create(&progress->thread, NULL, xnet_auto_progress,
 			     progress);
+#endif
 	if (ret) {
 		FI_WARN(&xnet_prov, FI_LOG_DOMAIN,
 			"unable to start progress thread\n");
@@ -1778,7 +1782,11 @@ void xnet_stop_progress(struct xnet_progress *progress)
 	progress->auto_progress = false;
 	fd_signal_set(&progress->signal);
 	ofi_genlock_unlock(progress->active_lock);
+#if HAVE_LITHE
+	(void) ofi_thread_join(&progress->thread, NULL);
+#else
 	(void) pthread_join(progress->thread, NULL);
+#endif
 }
 
 /* Because we may need to start the progress thread to support blocking CQ

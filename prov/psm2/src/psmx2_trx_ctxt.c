@@ -31,6 +31,9 @@
  */
 
 #include "psmx2.h"
+#if HAVE_LITHE
+#include <unix/osd.h>
+#endif
 
 int psmx2_trx_ctxt_cnt = 0;
 
@@ -86,7 +89,11 @@ int psmx2_am_trx_ctxt_handler(psm2_am_token_t token, psm2_amarg_t *args,
 	int err = 0;
 	int cmd;
 	struct disconnect_args *disconn;
+#if HAVE_LITHE
+	ofi_thread_t disconnect_thread;
+#else
 	pthread_t disconnect_thread;
+#endif
 	struct psmx2_trx_ctxt *trx_ctxt;
 	trx_ctxt = (struct psmx2_trx_ctxt *)hctx;
 
@@ -108,9 +115,14 @@ int psmx2_am_trx_ctxt_handler(psm2_am_token_t token, psm2_amarg_t *args,
 		if (disconn) {
 			disconn->trx_ctxt = trx_ctxt;
 			disconn->epaddr = epaddr;
+#if HAVE_LITHE
+			ofi_thread_create(&disconnect_thread, disconnect_func, disconn);
+			/* Lithe contexts don't need explicit detach - they clean up when done */
+#else
 			pthread_create(&disconnect_thread, NULL,
 				       disconnect_func, disconn);
 			pthread_detach(disconnect_thread);
+#endif
 		}
 		break;
 

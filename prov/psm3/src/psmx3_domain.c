@@ -138,6 +138,15 @@ static void psmx3_domain_start_progress(struct psmx3_fid_domain *domain)
 {
 	int err;
 
+#if HAVE_LITHE
+	err = ofi_thread_create(&domain->progress_thread, psmx3_progress_func, (void *)domain);
+	if (err) {
+		PSMX3_INFO(&psmx3_prov, FI_LOG_CORE,
+			"ofi_thread_create returns %d\n", err);
+	} else {
+		PSMX3_INFO(&psmx3_prov, FI_LOG_CORE, "progress thread started\n");
+	}
+#else
 	err = pthread_create(&domain->progress_thread, NULL,
 			     psmx3_progress_func, (void *)domain);
 	if (err) {
@@ -147,6 +156,7 @@ static void psmx3_domain_start_progress(struct psmx3_fid_domain *domain)
 	} else {
 		PSMX3_INFO(&psmx3_prov, FI_LOG_CORE, "progress thread started\n");
 	}
+#endif
 }
 
 static void psmx3_domain_stop_progress(struct psmx3_fid_domain *domain)
@@ -154,6 +164,20 @@ static void psmx3_domain_stop_progress(struct psmx3_fid_domain *domain)
 	int err;
 	void *exit_code;
 
+#if HAVE_LITHE
+	/* For Lithe, we can't use pthread_equal or pthread_cancel */
+	/* Just join the thread if it exists */
+	if (domain->progress_thread.context) {
+		err = ofi_thread_join(&domain->progress_thread, &exit_code);
+		if (err) {
+			PSMX3_INFO(&psmx3_prov, FI_LOG_CORE,
+				"ofi_thread_join returns %d\n", err);
+		} else {
+			PSMX3_INFO(&psmx3_prov, FI_LOG_CORE,
+				"progress thread exited\n");
+		}
+	}
+#else
 	if (!pthread_equal(domain->progress_thread, pthread_self())) {
 		err = pthread_cancel(domain->progress_thread);
 		if (err) {
@@ -172,6 +196,7 @@ static void psmx3_domain_stop_progress(struct psmx3_fid_domain *domain)
 					"PTHREAD_CANCELED" : "?");
 		}
 	}
+#endif
 }
 
 static int psmx3_domain_close(fid_t fid)

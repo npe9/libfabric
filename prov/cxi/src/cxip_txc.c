@@ -388,7 +388,7 @@ static void txc_cleanup(struct cxip_txc *txc)
 
 	start = ofi_gettime_ms();
 	while (cxip_txc_otx_reqs_get(txc)) {
-		sched_yield();
+		cxip_yield();
 
 		cxip_evtq_progress(&txc->tx_evtq, false);
 		cxip_ep_ctrl_progress_locked(txc->ep_obj, false);

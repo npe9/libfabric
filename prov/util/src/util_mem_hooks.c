@@ -524,11 +524,19 @@ static int ofi_intercept_symbol(struct ofi_intercept *intercept)
 
 void ofi_intercept_handler(const void *addr, size_t len)
 {
+#if HAVE_LITHE
+	ofi_mm_list_lock();
+#else
 	pthread_rwlock_rdlock(&mm_list_rwlock);
-	pthread_mutex_lock(&mm_lock);
+#endif
+	ofi_mm_lock_lock();
 	ofi_monitor_notify(memhooks_monitor, addr, len);
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
+#if HAVE_LITHE
+	ofi_mm_list_unlock();
+#else
 	pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
 }
 
 static void *ofi_intercept_mmap(void *start, size_t length,

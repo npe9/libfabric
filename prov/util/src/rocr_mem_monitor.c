@@ -143,11 +143,19 @@ static void rocr_mm_dealloc_cb(void *addr, void *user_data)
 	DEFINE_LIST(free_list);
 	struct rocr_mm_entry *entry;
 
+#if HAVE_LITHE
+	ofi_mm_list_lock();
+#else
 	pthread_rwlock_rdlock(&mm_list_rwlock);
-	pthread_mutex_lock(&mm_lock);
+#endif
+	ofi_mm_lock_lock();
 	rocr_mm_unsubscribe(rocr_monitor, addr, len, NULL, &free_list);
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
+#if HAVE_LITHE
+	ofi_mm_list_unlock();
+#else
 	pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
 
 	while (!dlist_empty(&free_list)) {
 		dlist_pop_front(&free_list, struct rocr_mm_entry, entry, entry);

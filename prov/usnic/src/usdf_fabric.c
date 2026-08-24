@@ -872,12 +872,20 @@ usdf_fabric_close(fid_t fid)
 	free(fp->fab_attr.name);
 	free(fp->fab_attr.prov_name);
 
+#if HAVE_LITHE
+	if (fp->fab_thread.context) {
+#else
 	if (fp->fab_thread) {
+#endif
 		ret = usdf_fabric_wake_thread(fp);
 		if (ret != 0) {
 			return ret;
 		}
+#if HAVE_LITHE
+		ofi_thread_join(&fp->fab_thread, &rv);
+#else
 		pthread_join(fp->fab_thread, &rv);
+#endif
 	}
 	usdf_timer_deinit(fp);
 	if (fp->fab_epollfd != OFI_EPOLL_INVALID) {
@@ -1012,8 +1020,12 @@ usdf_fabric_open(struct fi_fabric_attr *fattrp, struct fid_fabric **fabric,
 	ofi_atomic_initialize32(&fp->fab_refcnt, 0);
 	ofi_atomic_initialize32(&fp->num_blocked_waiting, 0);
 
+#if HAVE_LITHE
+	ret = ofi_thread_create(&fp->fab_thread, usdf_fabric_progression_thread, fp);
+#else
 	ret = pthread_create(&fp->fab_thread, NULL,
 			usdf_fabric_progression_thread, fp);
+#endif
 	if (ret != 0) {
 		ret = -ret;
 		USDF_INFO("unable to create progress thread\n");

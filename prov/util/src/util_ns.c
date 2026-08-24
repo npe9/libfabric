@@ -548,8 +548,12 @@ int ofi_ns_start_server(struct util_ns *ns)
 	}
 
 	ns->run = 1;
+#if HAVE_LITHE
+	ret = -ofi_thread_create(&ns->thread, util_ns_accept_handler, (void *) ns);
+#else
 	ret = -pthread_create(&ns->thread, NULL,
 			      util_ns_accept_handler, (void *) ns);
+#endif
 	if (ret)
 		goto err3;
 
@@ -583,7 +587,11 @@ void ofi_ns_stop_server(struct util_ns *ns)
 	if (sock != INVALID_SOCKET)
 		ofi_close_socket(sock);
 	util_ns_close_listen(ns);
+#if HAVE_LITHE
+	(void) ofi_thread_join(&ns->thread, NULL);
+#else
 	(void) pthread_join(ns->thread, NULL);
+#endif
 	rbtDelete(ns->map);
 }
 

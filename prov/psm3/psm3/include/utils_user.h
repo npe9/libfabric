@@ -248,15 +248,19 @@ void psm3_qwordcpy_safe(volatile uint64_t *dest, const uint64_t *src,
 
 extern uint32_t psm3_pico_per_cycle;	/* only for use in these functions */
 
+void psm3_timebase_ensure_init(void);
+
 /* this is only accurate for reasonably large numbers of cycles (at least tens) */
 static __inline__ uint64_t cycles_to_nanosecs(uint64_t cycs)
 {
+	psm3_timebase_ensure_init();
 	return (psm3_pico_per_cycle * cycs) / 1000ULL;
 }
 
 /* this is only accurate for reasonably large numbers of nsecs (at least tens) */
 static __inline__ uint64_t nanosecs_to_cycles(uint64_t ns)
 {
+	psm3_timebase_ensure_init();
 	return (ns * 1000ULL) / psm3_pico_per_cycle;
 }
 

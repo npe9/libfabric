@@ -48,6 +48,20 @@
 #include "cxip_faults.h"
 #include "fi_cxi_ext.h"
 
+#if HAVE_LITHE
+#include <lithe/lithe.h>
+/* Cooperative yield to the lithe scheduler. Bare sched_yield(2) only yields
+ * the kernel pthread; under lithe the calling vcore would keep running this
+ * uthread, so progress loops would still effectively spin. lithe_context_yield
+ * puts us back on the runnable queue so another uthread (e.g. another MPI
+ * progress context, the application uthread) gets the vcore.
+ */
+#define cxip_yield() lithe_context_yield()
+#else
+#include <sched.h>
+#define cxip_yield() sched_yield()
+#endif
+
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif
@@ -759,8 +773,23 @@ struct cxip_lni {
 	/* Software remapped communication profiles. */
 	struct dlist_entry remap_cps;
 
+#if HAVE_LITHE
+	/* Lithe has no rwlock; exclusive mutex matches ofi-locks-lithe.mdc. */
+	ofi_mutex_t cp_lock;
+#else
 	pthread_rwlock_t cp_lock;
+#endif
 };
+
+#if HAVE_LITHE
+#define cxip_lni_cp_rdlock(lni)	ofi_mutex_lock(&(lni)->cp_lock)
+#define cxip_lni_cp_wrlock(lni)	ofi_mutex_lock(&(lni)->cp_lock)
+#define cxip_lni_cp_unlock(lni)	ofi_mutex_unlock(&(lni)->cp_lock)
+#else
+#define cxip_lni_cp_rdlock(lni)	pthread_rwlock_rdlock(&(lni)->cp_lock)
+#define cxip_lni_cp_wrlock(lni)	pthread_rwlock_wrlock(&(lni)->cp_lock)
+#define cxip_lni_cp_unlock(lni)	pthread_rwlock_unlock(&(lni)->cp_lock)
+#endif
 
 /* A portals table define a network endpoint address. The endpoint address is
  * a {NIC + PID} and this can be configured against multiple VNIs
@@ -2784,7 +2813,11 @@ struct cxip_av {
 	 * threading, this lock is not used.
 	 */
 	bool lockless;
+#if HAVE_LITHE
+	ofi_mutex_t lock;
+#else
 	pthread_rwlock_t lock;
+#endif
 
 	/* AV is configured as symmetric. This is an optimization which enables
 	 * endpoints to use logical address.

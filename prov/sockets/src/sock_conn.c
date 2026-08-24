@@ -324,8 +324,13 @@ int sock_conn_stop_listener_thread(struct sock_conn_listener *conn_listener)
 	fd_signal_set(&conn_listener->signal);
 	ofi_mutex_unlock(&conn_listener->signal_lock);
 
+#if HAVE_LITHE
+	if (conn_listener->listener_thread.context &&
+	    ofi_thread_join(&conn_listener->listener_thread, NULL)) {
+#else
 	if (conn_listener->listener_thread &&
 	    pthread_join(conn_listener->listener_thread, NULL)) {
+#endif
 		SOCK_LOG_DBG("pthread join failed\n");
 	}
 
@@ -427,8 +432,12 @@ int sock_conn_start_listener_thread(struct sock_conn_listener *conn_listener)
 
 	conn_listener->do_listen = 1;
 	conn_listener->removed_from_epollfd = false;
+#if HAVE_LITHE
+	ret = ofi_thread_create(&conn_listener->listener_thread, sock_conn_listener_thread, conn_listener);
+#else
 	ret = pthread_create(&conn_listener->listener_thread, NULL,
 	                     sock_conn_listener_thread, conn_listener);
+#endif
 	if (ret < 0) {
 		SOCK_LOG_ERROR("failed to create conn listener thread\n");
 		goto err3;

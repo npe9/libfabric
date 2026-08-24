@@ -3143,7 +3143,7 @@ int cxip_build_ux_entry_info(struct cxip_ep *ep,
 	RXC_DBG(rxc, "Search for ULE dump initiated, req %p\n", req);
 	do {
 		cxip_evtq_progress(&rxc->base.rx_evtq, true);
-		sched_yield();
+		cxip_yield();
 	} while (!ux_dump->done);
 
 	RXC_DBG(rxc, "Search ULE dump done, req %p, count %ld\n",
@@ -3981,7 +3981,7 @@ static int cxip_rxc_hpc_msg_init(struct cxip_rxc *rxc_base)
 
 	/* Wait for PTE state change */
 	do {
-		sched_yield();
+		cxip_yield();
 		cxip_evtq_progress(&rxc->base.rx_evtq, true);
 	} while (rxc->base.rx_pte->state != state);
 

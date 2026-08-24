@@ -650,7 +650,11 @@ struct cxip_environment cxip_env = {
 	.hybrid_posted_recv_preemptive = 0,
 	.hybrid_unexpected_msg_preemptive = 0,
 	.fc_retry_usec_delay = 1000,
+#if HAVE_LITHE
+	.cntr_spin_before_yield = 0,
+#else
 	.cntr_spin_before_yield = 1000,
+#endif
 	.ctrl_rx_eq_max_size = 67108864,
 	.default_cq_size = CXIP_CQ_DEF_SZ,
 	.default_tx_size = CXIP_DEFAULT_TX_SIZE,

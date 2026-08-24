@@ -64,20 +64,35 @@ static int cxip_parse_cxi_addr(const char *node, const char *service,
 
 static inline void cxip_av_read_lock(struct cxip_av *av)
 {
-	if (!av->lockless)
+	if (!av->lockless) {
+#if HAVE_LITHE
+		ofi_mutex_lock(&av->lock);
+#else
 		pthread_rwlock_rdlock(&av->lock);
+#endif
+	}
 }
 
 static inline void cxip_av_write_lock(struct cxip_av *av)
 {
-	if (!av->lockless)
+	if (!av->lockless) {
+#if HAVE_LITHE
+		ofi_mutex_lock(&av->lock);
+#else
 		pthread_rwlock_wrlock(&av->lock);
+#endif
+	}
 }
 
 static inline void cxip_av_unlock(struct cxip_av *av)
 {
-	if (!av->lockless)
+	if (!av->lockless) {
+#if HAVE_LITHE
+		ofi_mutex_unlock(&av->lock);
+#else
 		pthread_rwlock_unlock(&av->lock);
+#endif
+	}
 }
 
 static int cxip_av_insert_addr(struct cxip_av *av, struct cxip_addr *addr,
@@ -915,7 +930,11 @@ int cxip_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 	dlist_init(&av->ep_list);
 	ofi_atomic_initialize32(&av->ref, 0);
 	av->lockless = dom->util_domain.threading == FI_THREAD_DOMAIN;
+#if HAVE_LITHE
+	ofi_mutex_init(&av->lock);
+#else
 	pthread_rwlock_init(&av->lock, NULL);
+#endif
 	av->av_entry_hash = NULL;
 	av->symmetric = !!(attr->flags & FI_SYMMETRIC);
 	ofi_atomic_initialize32(&av->av_entry_cnt, 0);

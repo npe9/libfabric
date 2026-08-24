@@ -43,16 +43,55 @@
 
 #include <ofi_osd.h>
 
+#if HAVE_LITHE
+/* Include Lithe headers for concurrency primitives */
+#ifndef _LITHE_MUTEX_H_INCLUDED
+/* Save stdatomic's atomic_init before parlib redefines it */
+#ifdef atomic_init
+#undef atomic_init
+#endif
+/* Rename parlib's atomic_init function to avoid conflict */
+#define atomic_init __parlib_atomic_init_fn
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wnested-externs"
+#include <lithe/mutex.h>
+#include <lithe/condvar.h>
+#pragma GCC diagnostic pop
+
+/* Restore stdatomic's atomic_init */
+#undef atomic_init
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+#define atomic_init(PTR, VAL) __atomic_store_n(PTR, VAL, __ATOMIC_RELAXED)
+#endif
+#endif
+
+#define _LITHE_MUTEX_H_INCLUDED
+#endif
+#endif /* HAVE_LITHE */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-
+#if HAVE_LITHE
+int ofi_wait_cond(lithe_condvar_t *cond, lithe_mutex_t *mut, int timeout_ms);
+#else
 int ofi_wait_cond(pthread_cond_t *cond, pthread_mutex_t *mut, int timeout_ms);
+#endif
 
 
-#if PT_LOCK_SPIN == 1
+#if HAVE_LITHE
+/* OFI proper: use Lithe mutex for spin (Lithe has no spinlock). See ofi-locks-lithe.mdc */
+#define ofi_spin_t_ lithe_mutex_t
+#define ofi_spin_init_(lock) lithe_mutex_init(lock, NULL)
+#define ofi_spin_destroy_(lock) (0)  /* Lithe mutexes don't need explicit destruction; return 0 */
+#define ofi_spin_lock_(lock) lithe_mutex_lock(lock)
+#define ofi_spin_trylock_(lock) lithe_mutex_trylock(lock)
+#define ofi_spin_unlock_(lock) lithe_mutex_unlock(lock)
+#elif PT_LOCK_SPIN == 1
 
 #define ofi_spin_t_ pthread_spinlock_t
 #define ofi_spin_init_(lock) pthread_spin_init(lock, PTHREAD_PROCESS_PRIVATE)
@@ -70,7 +109,7 @@ int ofi_wait_cond(pthread_cond_t *cond, pthread_mutex_t *mut, int timeout_ms);
 #define ofi_spin_trylock_(lock) pthread_mutex_trylock(lock)
 #define ofi_spin_unlock_(lock) pthread_mutex_unlock(lock)
 
-#endif /* PT_LOCK_SPIN */
+#endif /* HAVE_LITHE / PT_LOCK_SPIN */
 
 #if ENABLE_DEBUG
 
@@ -192,12 +231,49 @@ static inline int ofi_spin_held_op(ofi_spin_t *lock)
 	return ofi_spin_held(lock);
 }
 
+#if HAVE_LITHE
+/* When Lithe is enabled, use Lithe's own locks directly */
+/* Include Lithe headers with proper isolation to avoid conflicts */
+/* Only include if not already included to prevent redefinition */
+#ifndef _LITHE_MUTEX_H_INCLUDED
+/* Include lithe headers with conflict resolution */
+/* Save stdatomic's atomic_init before parlib redefines it */
+#ifdef atomic_init
+#undef atomic_init
+#endif
+/* Rename parlib's atomic_init function to avoid conflict */
+#define atomic_init __parlib_atomic_init_fn
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wnested-externs"
+#include <lithe/mutex.h>
+#pragma GCC diagnostic pop
+
+/* Restore stdatomic's atomic_init */
+#undef atomic_init
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+#define atomic_init(PTR, VAL) __atomic_store_n(PTR, VAL, __ATOMIC_RELAXED)
+#endif
+#endif
+
+#define _LITHE_MUTEX_H_INCLUDED
+#endif
+#define ofi_mutex_t_ lithe_mutex_t
+#define ofi_mutex_init_(lock) lithe_mutex_init(lock, NULL)
+#define ofi_mutex_destroy_(lock) ((void)0)  /* Lithe mutexes don't need explicit destruction */
+#define ofi_mutex_lock_(lock) lithe_mutex_lock(lock)
+#define ofi_mutex_trylock_(lock) lithe_mutex_trylock(lock)
+#define ofi_mutex_unlock_(lock) lithe_mutex_unlock(lock)
+#else
 #define ofi_mutex_t_ pthread_mutex_t
 #define ofi_mutex_init_(lock) pthread_mutex_init(lock, NULL)
 #define ofi_mutex_destroy_(lock) pthread_mutex_destroy(lock)
 #define ofi_mutex_lock_(lock) pthread_mutex_lock(lock)
 #define ofi_mutex_trylock_(lock) pthread_mutex_trylock(lock)
 #define ofi_mutex_unlock_(lock) pthread_mutex_unlock(lock)
+#endif
 
 #if ENABLE_DEBUG
 
@@ -220,12 +296,18 @@ static inline int ofi_mutex_init(ofi_mutex_t *lock)
 
 static inline void ofi_mutex_destroy(ofi_mutex_t *lock)
 {
+#if HAVE_LITHE
+	/* Lithe mutexes don't need explicit destruction */
+	assert(lock->is_initialized);
+	lock->is_initialized = 0;
+#else
 	int ret;
 
 	assert(lock->is_initialized);
 	lock->is_initialized = 0;
 	ret = ofi_mutex_destroy_(&lock->impl);
 	assert(!ret);
+#endif
 }
 
 static inline void ofi_mutex_lock(ofi_mutex_t *lock)
@@ -280,7 +362,13 @@ static inline void ofi_mutex_unlock_noop(ofi_mutex_t *lock)
 }
 
 static inline int
-ofi_pthread_wait_cond(pthread_cond_t *cond, ofi_mutex_t *lock, int timeout_ms)
+ofi_pthread_wait_cond(
+#if HAVE_LITHE
+	lithe_condvar_t *cond,
+#else
+	pthread_cond_t *cond,
+#endif
+	ofi_mutex_t *lock, int timeout_ms)
 {
 	assert(lock->is_initialized);
 	return ofi_wait_cond(cond, &lock->impl, timeout_ms);

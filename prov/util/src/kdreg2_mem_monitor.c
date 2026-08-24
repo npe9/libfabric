@@ -35,6 +35,10 @@
 #if HAVE_KDREG2_MONITOR
 
 #include "ofi_hmem.h"
+#if HAVE_LITHE
+#include <unix/osd.h>
+#include <sys/epoll.h>
+#endif
 
 #define EVICTOR_THREAD_ATTR NULL
 #define INFINITE_TIMEOUT -1
@@ -121,6 +125,24 @@ static int kdreg2_read_evictions(struct ofi_kdreg2 *kdreg2)
 		switch (event.type) {
 		case KDREG2_EVENT_MAPPING_CHANGE:
 
+#if HAVE_LITHE
+			/* The evictor is a Lithe context; it only ever runs
+			 * while the Lithe scheduler is active, so it must use
+			 * the REAL Lithe mm locks -- not the
+			 * ofi_cleanup_in_progress-gated ofi_mm_* wrappers,
+			 * which become no-ops during finalize and would let
+			 * this context walk the MR-cache tree unserialized
+			 * while it is being torn down. */
+			lithe_mutex_lock(&mm_list_rwlock);
+			lithe_mutex_lock(&mm_lock);
+
+			ofi_monitor_notify(&kdreg2->monitor,
+					   event.u.mapping_change.addr,
+					   event.u.mapping_change.len);
+
+			lithe_mutex_unlock(&mm_lock);
+			lithe_mutex_unlock(&mm_list_rwlock);
+#else
 			pthread_rwlock_rdlock(&mm_list_rwlock);
 			pthread_mutex_lock(&mm_lock);
 
@@ -130,6 +152,7 @@ static int kdreg2_read_evictions(struct ofi_kdreg2 *kdreg2)
 
 			pthread_mutex_unlock(&mm_lock);
 			pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
 
 			break;
 
@@ -157,6 +180,16 @@ static void kdreg2_close_fd(struct ofi_kdreg2 *kdreg2)
 	kdreg2->status_data = NULL;
 }
 
+#if HAVE_LITHE
+static void kdreg2_close_epfd(struct ofi_kdreg2 *kdreg2)
+{
+	if (kdreg2->evictor_epfd >= 0) {
+		close(kdreg2->evictor_epfd);
+		kdreg2->evictor_epfd = -1;
+	}
+}
+#endif
+
 static void *kdreg2_evictor(void *arg)
 {
 	struct ofi_kdreg2 *kdreg2 = (struct ofi_kdreg2 *) arg;
@@ -171,11 +204,35 @@ static void *kdreg2_evictor(void *arg)
 		},
 	};
 	int n;
+#if HAVE_LITHE
+	/* Park on the aggregate epoll fd via the parlib reactor. A single-fd
+	 * poll() is turned into parlib_reactor_wait() by __wrap_poll, which
+	 * blocks this Lithe context and RETURNS THE VCORE to the scheduler so
+	 * the rank's own contexts (PMIx fence, MPI progress) make progress.
+	 * A direct 2-fd poll() cannot be represented as one reactor waiter and
+	 * degrades to a cooperative busy-loop that pins a vcore forever -- the
+	 * cause of the MPI_Init hang at VCORE_LIMIT=1 (single vcore fully
+	 * consumed) and, together with oversubscription, at VCORE_LIMIT>=2. */
+	struct pollfd wait_pfd = {
+		.fd = kdreg2->evictor_epfd,
+		.events = POLLIN,
+	};
+#endif
 
 	while (1) {
 
 		/* wait until there are events to read */
+#if HAVE_LITHE
+		/* Block (yield the vcore) on the aggregate fd, then discover
+		 * which underlying fd fired with a non-blocking probe so the
+		 * revents-based logic below is unchanged. */
+		wait_pfd.revents = 0;
+		n = poll(&wait_pfd, 1, INFINITE_TIMEOUT);
+		if (n > 0)
+			n = poll(pollfd, 2, 0);
+#else
 		n = poll(pollfd, 2, INFINITE_TIMEOUT);
+#endif
 		if (n == 0)           /* timeout(?) */
 			continue;
 
@@ -201,6 +258,13 @@ static void *kdreg2_evictor(void *arg)
 	}
 
 error_ret:
+
+#if HAVE_LITHE
+	/* Publish exit before the context returns and self-destroys, so a
+	 * cooperative waiter (kdreg2_monitor_stop) can safely proceed to free
+	 * the MR-cache tree knowing this context will no longer touch it. */
+	__atomic_store_n(&kdreg2->evictor_exited, 1, __ATOMIC_RELEASE);
+#endif
 
 	return (void *) (intptr_t) ret;
 }
@@ -257,18 +321,57 @@ static int kdreg2_monitor_start(struct ofi_mem_monitor *monitor)
 
 	kdreg2->status_data = config_data.status_data;
 
+#if HAVE_LITHE
+	/* Aggregate the device fd and the exit pipe into one epoll set so the
+	 * evictor can block on a SINGLE fd via the parlib reactor (see the
+	 * comment in kdreg2_evictor). */
+	kdreg2->evictor_epfd = epoll_create1(0);
+	if (kdreg2->evictor_epfd < 0) {
+		FI_WARN(&core_prov, FI_LOG_MR,
+			"Failed to create epoll fd for kdreg2 monitor: %s\n",
+			strerror(errno));
+		ret = -errno;
+		goto close_fd;
+	}
+	{
+		struct epoll_event ev;
+
+		ev.events = EPOLLIN;
+		ev.data.fd = kdreg2->fd;
+		if (epoll_ctl(kdreg2->evictor_epfd, EPOLL_CTL_ADD,
+			      kdreg2->fd, &ev) < 0) {
+			ret = -errno;
+			goto close_epfd;
+		}
+		ev.events = EPOLLIN;
+		ev.data.fd = kdreg2->exit_pipe[0];
+		if (epoll_ctl(kdreg2->evictor_epfd, EPOLL_CTL_ADD,
+			      kdreg2->exit_pipe[0], &ev) < 0) {
+			ret = -errno;
+			goto close_epfd;
+		}
+	}
+	__atomic_store_n(&kdreg2->evictor_exited, 0, __ATOMIC_RELEASE);
+	ret = ofi_thread_create(&kdreg2->thread, kdreg2_evictor, kdreg2);
+#else
 	ret = pthread_create(&kdreg2->thread, EVICTOR_THREAD_ATTR,
 			     kdreg2_evictor, kdreg2);
+#endif
 	if (ret) {
 		FI_WARN(&core_prov, FI_LOG_MR,
 			"Failed to start thread for kdreg2 monitor: %d.\n",
 			ret);
-		goto close_fd;
+		goto close_epfd;
 	}
 
 	FI_INFO(&core_prov, FI_LOG_MR, "Kdreg2 memory monitor started.\n");
 
 	return 0;
+
+close_epfd:
+#if HAVE_LITHE
+	kdreg2_close_epfd(kdreg2);
+#endif
 
 close_fd:
 
@@ -306,7 +409,21 @@ static void kdreg2_monitor_stop(struct ofi_mem_monitor *monitor)
 		 */
 	}
 
+#if HAVE_LITHE
+	/* The evictor is a fork-join Lithe context: on return it self-destroys
+	 * via the scheduler context_exit hook, so there is no blocking join.
+	 * ofi_thread_join() is unsafe here (it would double-decrement the
+	 * scheduler context count and double-free the context). Instead,
+	 * cooperatively yield the hart until the evictor has published its
+	 * exit, so it is guaranteed to no longer touch the MR-cache tree
+	 * before we close its fd / the caller frees the tree. */
+	while (!__atomic_load_n(&kdreg2->evictor_exited, __ATOMIC_ACQUIRE))
+		lithe_context_yield();
+	kdreg2->thread.context = NULL;
+	kdreg2_close_epfd(kdreg2);
+#else
 	pthread_join(kdreg2->thread, NULL);
+#endif
 
 	kdreg2_close_fd(kdreg2);
 	kdreg2_close_pipe(kdreg2);
@@ -361,6 +478,9 @@ static struct ofi_kdreg2 kdreg2_mm = {
 	.monitor.name        = "kdreg2",
 	.fd                  = -1,
 	.exit_pipe           = { -1, -1 },
+#if HAVE_LITHE
+	.evictor_epfd        = -1,
+#endif
 	.status_data         = NULL,
 };
 

@@ -60,6 +60,9 @@
 #include <ofi_mem.h>
 #include "sock.h"
 #include "sock_util.h"
+#if HAVE_LITHE
+#include <lithe/lithe.h>
+#endif
 
 #define SOCK_LOG_DBG(...) _SOCK_LOG_DBG(FI_LOG_EP_DATA, __VA_ARGS__)
 #define SOCK_LOG_ERROR(...) _SOCK_LOG_ERROR(FI_LOG_EP_DATA, __VA_ARGS__)
@@ -2327,7 +2330,7 @@ void sock_pe_add_tx_ctx(struct sock_pe *pe, struct sock_tx_ctx *ctx)
 {
 	struct dlist_entry *entry;
 	struct sock_tx_ctx *curr_ctx;
-	pthread_mutex_lock(&pe->list_lock);
+	ofi_mutex_lock(&pe->list_lock);
 	for (entry = pe->tx_list.next; entry != &pe->tx_list;
 	     entry = entry->next) {
 		curr_ctx = container_of(entry, struct sock_tx_ctx, pe_entry);
@@ -2338,7 +2341,7 @@ void sock_pe_add_tx_ctx(struct sock_pe *pe, struct sock_tx_ctx *ctx)
 	dlist_insert_tail(&ctx->pe_entry, &pe->tx_list);
 	sock_pe_signal(pe);
 out:
-	pthread_mutex_unlock(&pe->list_lock);
+	ofi_mutex_unlock(&pe->list_lock);
 	SOCK_LOG_DBG("TX ctx added to PE\n");
 }
 
@@ -2346,7 +2349,7 @@ void sock_pe_add_rx_ctx(struct sock_pe *pe, struct sock_rx_ctx *ctx)
 {
 	struct dlist_entry *entry;
 	struct sock_rx_ctx *curr_ctx;
-	pthread_mutex_lock(&pe->list_lock);
+	ofi_mutex_lock(&pe->list_lock);
 	for (entry = pe->rx_list.next; entry != &pe->rx_list;
 	     entry = entry->next) {
 		curr_ctx = container_of(entry, struct sock_rx_ctx, pe_entry);
@@ -2356,22 +2359,22 @@ void sock_pe_add_rx_ctx(struct sock_pe *pe, struct sock_rx_ctx *ctx)
 	dlist_insert_tail(&ctx->pe_entry, &pe->rx_list);
 	sock_pe_signal(pe);
 out:
-	pthread_mutex_unlock(&pe->list_lock);
+	ofi_mutex_unlock(&pe->list_lock);
 	SOCK_LOG_DBG("RX ctx added to PE\n");
 }
 
 void sock_pe_remove_tx_ctx(struct sock_tx_ctx *tx_ctx)
 {
-	pthread_mutex_lock(&tx_ctx->domain->pe->list_lock);
+	ofi_mutex_lock(&tx_ctx->domain->pe->list_lock);
 	dlist_remove(&tx_ctx->pe_entry);
-	pthread_mutex_unlock(&tx_ctx->domain->pe->list_lock);
+	ofi_mutex_unlock(&tx_ctx->domain->pe->list_lock);
 }
 
 void sock_pe_remove_rx_ctx(struct sock_rx_ctx *rx_ctx)
 {
-	pthread_mutex_lock(&rx_ctx->domain->pe->list_lock);
+	ofi_mutex_lock(&rx_ctx->domain->pe->list_lock);
 	dlist_remove(&rx_ctx->pe_entry);
-	pthread_mutex_unlock(&rx_ctx->domain->pe->list_lock);
+	ofi_mutex_unlock(&rx_ctx->domain->pe->list_lock);
 }
 
 static int sock_pe_progress_rx_ep(struct sock_pe *pe,
@@ -2649,12 +2652,12 @@ static void *sock_pe_progress_thread(void *data)
 	SOCK_LOG_DBG("Progress thread started\n");
 	sock_pe_set_affinity();
 	while (*((volatile int *)&pe->do_progress)) {
-		pthread_mutex_lock(&pe->list_lock);
+		ofi_mutex_lock(&pe->list_lock);
 		if (pe->domain->progress_mode == FI_PROGRESS_AUTO &&
 		    sock_pe_wait_ok(pe)) {
-			pthread_mutex_unlock(&pe->list_lock);
+			ofi_mutex_unlock(&pe->list_lock);
 			sock_pe_wait(pe);
-			pthread_mutex_lock(&pe->list_lock);
+			ofi_mutex_lock(&pe->list_lock);
 		}
 
 		if (!dlist_empty(&pe->tx_list)) {
@@ -2665,7 +2668,7 @@ static void *sock_pe_progress_thread(void *data)
 				ret = sock_pe_progress_tx_ctx(pe, tx_ctx);
 				if (ret < 0) {
 					SOCK_LOG_ERROR("failed to progress TX\n");
-					pthread_mutex_unlock(&pe->list_lock);
+					ofi_mutex_unlock(&pe->list_lock);
 					return NULL;
 				}
 			}
@@ -2679,12 +2682,17 @@ static void *sock_pe_progress_thread(void *data)
 				ret = sock_pe_progress_rx_ctx(pe, rx_ctx);
 				if (ret < 0) {
 					SOCK_LOG_ERROR("failed to progress RX\n");
-					pthread_mutex_unlock(&pe->list_lock);
+					ofi_mutex_unlock(&pe->list_lock);
 					return NULL;
 				}
 			}
 		}
-		pthread_mutex_unlock(&pe->list_lock);
+		ofi_mutex_unlock(&pe->list_lock);
+		
+		/* Always yield to allow other contexts to run and prevent busy-waiting */
+#if HAVE_LITHE
+		lithe_context_yield();
+#endif
 	}
 
 	SOCK_LOG_DBG("Progress thread terminated\n");
@@ -2727,7 +2735,7 @@ struct sock_pe *sock_pe_init(struct sock_domain *domain)
 	dlist_init(&pe->rx_list);
 	ofi_mutex_init(&pe->lock);
 	ofi_mutex_init(&pe->signal_lock);
-	pthread_mutex_init(&pe->list_lock, NULL);
+	ofi_mutex_init(&pe->list_lock);
 	pe->domain = domain;
 
 
@@ -2761,8 +2769,12 @@ struct sock_pe *sock_pe_init(struct sock_domain *domain)
 			goto err5;
 
 		pe->do_progress = 1;
+#if HAVE_LITHE
+		if (ofi_thread_create(&pe->progress_thread, sock_pe_progress_thread, (void *)pe)) {
+#else
 		if (pthread_create(&pe->progress_thread, NULL,
 				   sock_pe_progress_thread, (void *)pe)) {
+#endif
 			SOCK_LOG_ERROR("Couldn't create progress thread\n");
 			goto err5;
 		}
@@ -2808,7 +2820,11 @@ void sock_pe_finalize(struct sock_pe *pe)
 	if (pe->domain->progress_mode == FI_PROGRESS_AUTO) {
 		pe->do_progress = 0;
 		sock_pe_signal(pe);
+#if HAVE_LITHE
+		ofi_thread_join(&pe->progress_thread, NULL);
+#else
 		pthread_join(pe->progress_thread, NULL);
+#endif
 		ofi_close_socket(pe->signal_fds[0]);
 		ofi_close_socket(pe->signal_fds[1]);
 	}
@@ -2820,7 +2836,7 @@ void sock_pe_finalize(struct sock_pe *pe)
 	sock_pe_free_util_pool(pe);
 	ofi_mutex_destroy(&pe->lock);
 	ofi_mutex_destroy(&pe->signal_lock);
-	pthread_mutex_destroy(&pe->list_lock);
+	ofi_mutex_destroy(&pe->list_lock);
 	ofi_epoll_close(pe->epoll_set);
 	free(pe);
 	SOCK_LOG_DBG("Progress engine finalize: OK\n");

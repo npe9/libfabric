@@ -140,7 +140,7 @@ static int cxip_mr_wait_append(struct cxip_ep_obj *ep_obj,
 {
 	/* Wait for PTE LE append status update */
 	do {
-		sched_yield();
+		cxip_yield();
 		cxip_ep_tgt_ctrl_progress_locked(ep_obj, true);
 	} while (mr->mr_state != CXIP_MR_LINKED &&
 		 mr->mr_state != CXIP_MR_LINK_ERR);
@@ -227,7 +227,7 @@ static bool cxip_mr_disable_check_count_events(struct cxip_mr *mr,
 		if (ofi_gettime_ns() >= end)
 			return false;
 
-		sched_yield();
+		cxip_yield();
 		cxip_ep_tgt_ctrl_progress_locked(ep_obj, true);
 	}
 }
@@ -250,7 +250,7 @@ static int cxip_mr_disable_std(struct cxip_mr *mr)
 		CXIP_FATAL("Unable to queue unlink command: %d\n", ret);
 
 	do {
-		sched_yield();
+		cxip_yield();
 		cxip_ep_tgt_ctrl_progress_locked(ep_obj, true);
 	} while (mr->mr_state != CXIP_MR_UNLINKED);
 
@@ -415,7 +415,7 @@ static int cxip_mr_disable_opt(struct cxip_mr *mr)
 	}
 
 	do {
-		sched_yield();
+		cxip_yield();
 		cxip_ep_tgt_ctrl_progress_locked(ep_obj, true);
 	} while (mr->mr_state != CXIP_MR_UNLINKED);
 
@@ -1043,7 +1043,7 @@ void cxip_ctrl_mr_cache_flush(struct cxip_ep_obj *ep_obj)
 		assert(ret == FI_SUCCESS);
 
 		do {
-			sched_yield();
+			cxip_yield();
 			cxip_ep_tgt_ctrl_progress_locked(ep_obj, true);
 		} while (mr_cache->ctrl_req->mr.mr->mr_state !=
 			 CXIP_MR_UNLINKED);
@@ -1079,7 +1079,7 @@ void cxip_ctrl_mr_cache_flush(struct cxip_ep_obj *ep_obj)
 		}
 
 		do {
-			sched_yield();
+			cxip_yield();
 			cxip_ep_tgt_ctrl_progress_locked(ep_obj, true);
 		} while (mr_cache->ctrl_req->mr.mr->mr_state !=
 			 CXIP_MR_UNLINKED);

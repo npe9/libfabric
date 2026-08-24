@@ -39,6 +39,9 @@
 #include <ofi_enosys.h>
 #include <ofi_util.h>
 #include <ofi_epoll.h>
+#if HAVE_LITHE
+#include <lithe/lithe.h>
+#endif
 
 
 int ofi_trywait(struct fid_fabric *fabric, struct fid **fids, int count)
@@ -390,22 +393,26 @@ static int util_wait_fd_run(struct fid_wait *wait_fid, int timeout)
 		if (ofi_adjust_timeout(endtime, &timeout))
 			return -FI_ETIMEDOUT;
 
-		ret = (wait->util_wait.wait_obj == FI_WAIT_FD) ?
-		      ofi_epoll_wait(wait->epoll_fd, &event, 1, timeout) :
-		      ofi_pollfds_wait(wait->pollfds, &event, 1, timeout);
-		if (ret > 0)
-			return FI_SUCCESS;
+	ret = (wait->util_wait.wait_obj == FI_WAIT_FD) ?
+	      ofi_epoll_wait(wait->epoll_fd, &event, 1, timeout) :
+	      ofi_pollfds_wait(wait->pollfds, &event, 1, timeout);
+	if (ret > 0)
+		return FI_SUCCESS;
 
-		if (ret < 0) {
+	if (ret < 0) {
 #if ENABLE_DEBUG
-			/* ignore interrupts in order to enable debugging */
-			if (ret == -FI_EINTR)
-				continue;
+		/* ignore interrupts in order to enable debugging */
+		if (ret == -FI_EINTR)
+			continue;
 #endif
-			FI_WARN(wait->util_wait.prov, FI_LOG_FABRIC,
-				"poll failed\n");
-			return ret;
-		}
+		FI_WARN(wait->util_wait.prov, FI_LOG_FABRIC,
+			"poll failed\n");
+		return ret;
+	}
+
+	/* ret == 0 means timeout with no events. In lithified builds, wrapped
+	 * epoll_wait parks the current continuation on parlib's scheduler-driven
+	 * reactor; retry so wait_try can observe any completion or deadline. */
 	}
 }
 
@@ -623,7 +630,11 @@ static int util_wait_yield_run(struct fid_wait *wait_fid, int timeout)
 			}
 		}
 		ofi_mutex_unlock(&wait->util_wait.lock);
+#if HAVE_LITHE
+		lithe_context_yield();
+#else
 		sched_yield();
+#endif
 	}
 
 	ofi_mutex_lock(&wait->signal_lock);

@@ -202,11 +202,11 @@ static struct fid_logging log_fid = {
 static int ofi_close_import(struct fid *fid)
 {
 	/* Reset logging ops to default */
-	pthread_mutex_lock(&common_locks.ini_lock);
+	ofi_mutex_lock_(&common_locks.ini_lock);
 	log_fid.ops->enabled = ofi_log_enabled;
 	log_fid.ops->ready = ofi_log_ready;
 	log_fid.ops->log = ofi_log;
-	pthread_mutex_unlock(&common_locks.ini_lock);
+	ofi_mutex_unlock_(&common_locks.ini_lock);
 	return 0;
 }
 
@@ -231,7 +231,7 @@ static int ofi_logging_import(struct fid *fid)
 	if (impfid->ops->size < sizeof(struct fi_ops_log))
 		return -FI_EINVAL;
 
-	pthread_mutex_lock(&common_locks.ini_lock);
+	ofi_mutex_lock_(&common_locks.ini_lock);
 	if (impfid->ops->enabled)
 		log_fid.ops->enabled = impfid->ops->enabled;
 	if (impfid->ops->ready)
@@ -240,7 +240,7 @@ static int ofi_logging_import(struct fid *fid)
 		log_fid.ops->log = impfid->ops->log;
 
 	impfid->fid.ops = &impfid_ops;
-	pthread_mutex_unlock(&common_locks.ini_lock);
+	ofi_mutex_unlock_(&common_locks.ini_lock);
 	return 0;
 }
 
@@ -282,7 +282,7 @@ int ofi_open_log(uint32_t version, void *attr, size_t attr_len,
 		return -FI_EBADFLAGS;
 
 	/* The logging subsystem can be opened once only! */
-	pthread_mutex_lock(&common_locks.ini_lock);
+	ofi_mutex_lock_(&common_locks.ini_lock);
 	if (log_fid.ops->enabled != ofi_log_enabled ||
 	    log_fid.ops->ready != ofi_log_ready ||
 	    log_fid.ops->log != ofi_log) {
@@ -295,7 +295,7 @@ int ofi_open_log(uint32_t version, void *attr, size_t attr_len,
 	ret = 0;
 
 unlock:
-	pthread_mutex_unlock(&common_locks.ini_lock);
+	ofi_mutex_unlock_(&common_locks.ini_lock);
 	return ret;
 }
 

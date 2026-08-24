@@ -114,12 +114,22 @@ static void *ofi_uffd_handler(void *arg)
 		if (ret < 0 || fds[1].revents)
 			break;
 
+#if HAVE_LITHE
+		ofi_mm_list_lock();
+		ofi_mm_lock_lock();
+#else
 		pthread_rwlock_rdlock(&mm_list_rwlock);
 		pthread_mutex_lock(&mm_lock);
+#endif
 		ret = read(uffd.fd, &msg, sizeof(msg));
 		if (ret != sizeof(msg)) {
+#if HAVE_LITHE
+			ofi_mm_lock_unlock();
+			ofi_mm_list_unlock();
+#else
 			pthread_mutex_unlock(&mm_lock);
 			pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
 			if (errno != EAGAIN && errno != EINTR)
 				break;
 			continue;
@@ -153,8 +163,13 @@ static void *ofi_uffd_handler(void *arg)
 				"Unhandled uffd event %d\n", msg.event);
 			break;
 		}
-		pthread_mutex_unlock(&mm_lock);
-		pthread_rwlock_unlock(&mm_list_rwlock);
+#if HAVE_LITHE
+			ofi_mm_lock_unlock();
+			ofi_mm_list_unlock();
+#else
+			pthread_mutex_unlock(&mm_lock);
+			pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
 	}
 	return NULL;
 }
@@ -400,7 +415,11 @@ static int ofi_uffd_start(struct ofi_mem_monitor *monitor)
 		goto close_fd;
 	}
 
+#if HAVE_LITHE
+	ret = ofi_thread_create(&uffd.thread, ofi_uffd_handler, &uffd);
+#else
 	ret = pthread_create(&uffd.thread, NULL, ofi_uffd_handler, &uffd);
+#endif
 	if (ret) {
 		FI_WARN(&core_prov, FI_LOG_MR,
 			"failed to create handler thread %s\n", strerror(ret));
@@ -444,7 +463,11 @@ static void ofi_uffd_stop(struct ofi_mem_monitor *monitor)
 			strerror(errno));
 	}
 
+#if HAVE_LITHE
+	ofi_thread_join(&uffd.thread, NULL);
+#else
 	pthread_join(uffd.thread, NULL);
+#endif
 
 	ofi_uffd_close_fd(&uffd);
 	ofi_uffd_close_pipe(&uffd);

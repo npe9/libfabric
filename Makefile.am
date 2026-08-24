@@ -28,7 +28,7 @@ pkglib_LTLIBRARIES = $(DL_PROVIDERS)
 
 
 ACLOCAL_AMFLAGS = -I config
-AM_CFLAGS = -Wall
+AM_CFLAGS = -Wall -Wno-unused-function -Wno-unused-variable
 
 if HAVE_LD_VERSION_SCRIPT
     libfabric_version_script = -Wl,--version-script=$(builddir)/libfabric.map
@@ -163,20 +163,20 @@ bin_SCRIPTS =
 
 util_fi_info_SOURCES = \
 	util/info.c
-util_fi_info_LDADD = $(linkback)
+util_fi_info_LDADD = $(linkback) $(lithe_LIBS)
 
 util_fi_strerror_SOURCES = \
 	util/strerror.c
-util_fi_strerror_LDADD = $(linkback)
+util_fi_strerror_LDADD = $(linkback) $(lithe_LIBS)
 
 util_fi_pingpong_SOURCES = \
 	util/pingpong.c
-util_fi_pingpong_LDADD = $(linkback)
+util_fi_pingpong_LDADD = $(linkback) $(lithe_LIBS)
 
 if HAVE_MONITOR
 util_fi_mon_sampler_SOURCES = \
 	util/mon_sampler.c
-util_fi_mon_sampler_LDADD = $(linkback)
+util_fi_mon_sampler_LDADD = $(linkback) $(lithe_LIBS)
 endif
 
 nodist_src_libfabric_la_SOURCES =
@@ -229,16 +229,18 @@ src_libfabric_la_SOURCES =			\
 	$(common_hook_srcs)			\
 	$(common_srcs)
 
-src_libfabric_la_CPPFLAGS = $(AM_CPPFLAGS)
-src_libfabric_la_LDFLAGS =
-src_libfabric_la_LIBADD =
+src_libfabric_la_CPPFLAGS = $(AM_CPPFLAGS) $(lithe_CPPFLAGS)
+src_libfabric_la_LIBADD = $(lithe_LIBS)
 src_libfabric_la_DEPENDENCIES = libfabric.map
 
+src_libfabric_la_LDFLAGS = -export-dynamic \
+		   $(libfabric_version_script) \
+		   $(lithe_LDFLAGS) -L/g/g17/evans117/src/project/src/installs/lithe/lib -L/g/g17/evans117/src/project/src/installs/parlib/lib -Wl,-rpath,/g/g17/evans117/src/project/src/installs/lithe/lib:/g/g17/evans117/src/project/src/installs/parlib/lib
+			   $(libfabric_version_script) \
+			   $(lithe_LDFLAGS)
 if !EMBEDDED
 src_libfabric_la_LDFLAGS += -version-info 31:0:30
 endif
-src_libfabric_la_LDFLAGS += -export-dynamic \
-			   $(libfabric_version_script)
 rdmainclude_HEADERS += \
 	$(top_srcdir)/include/rdma/fabric.h \
 	$(top_srcdir)/include/rdma/fi_atomic.h \
@@ -531,3 +533,14 @@ am__is_gnu_make = { \
     false; \
   fi; \
 }
+
+# Suppress warnings from parlib headers when including Lithe in osd.c
+if HAVE_LITHE
+src/unix/libfabric_la-osd.lo: CFLAGS = $(AM_CFLAGS) -Wno-unused-function -Wno-unused-variable
+if LINUX
+src/linux/libfabric_la-osd.lo: CFLAGS = $(AM_CFLAGS) -Wno-unused-function -Wno-unused-variable
+endif
+if MACOS
+src/osx/libfabric_la-osd.lo: CFLAGS = $(AM_CFLAGS) -Wno-unused-function -Wno-unused-variable
+endif
+endif

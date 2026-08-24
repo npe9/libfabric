@@ -86,7 +86,6 @@ int psmx3_am_trx_ctxt_handler(psm2_am_token_t token, psm2_amarg_t *args,
 	int err = 0, err2 = 0;
 	int cmd;
 	struct disconnect_args *disconn;
-	pthread_t disconnect_thread;
 	struct psmx3_trx_ctxt *trx_ctxt;
 	trx_ctxt = (struct psmx3_trx_ctxt *)hctx;
 
@@ -108,6 +107,15 @@ int psmx3_am_trx_ctxt_handler(psm2_am_token_t token, psm2_amarg_t *args,
 		if (disconn) {
 			disconn->trx_ctxt = trx_ctxt;
 			disconn->epaddr = epaddr;
+#if HAVE_LITHE
+			ofi_thread_t disconnect_thread;
+			err2 = ofi_thread_create(&disconnect_thread, disconnect_func, disconn);
+			if (err2)
+				PSMX3_WARN(&psmx3_prov, FI_LOG_CORE,
+				        "cannot create disconnect thread\n");
+			/* Lithe contexts are self-detaching, no explicit detach needed */
+#else
+			pthread_t disconnect_thread;
 			err2 = pthread_create(&disconnect_thread, NULL,
 			                      disconnect_func, disconn);
 			if (err2)
@@ -115,6 +123,7 @@ int psmx3_am_trx_ctxt_handler(psm2_am_token_t token, psm2_amarg_t *args,
 				        "cannot create disconnect thread\n");
 			else
 				pthread_detach(disconnect_thread);
+#endif
 		}
 		break;
 

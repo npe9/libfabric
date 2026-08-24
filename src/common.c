@@ -80,10 +80,27 @@ struct fi_provider core_prov = {
 	.fi_version = OFI_VERSION_LATEST
 };
 
+#if HAVE_LITHE
+struct ofi_common_locks common_locks;
+
+/* Include Lithe headers for mutex initialization */
+#include <lithe/mutex.h>
+
+/* Don't initialize Lithe mutexes in constructor - do it lazily when first used */
+/* Initialize common locks - called from ofi_init_lithe_scheduler() */
+void ofi_init_common_locks(void) {
+	lithe_mutexattr_t attr;
+	lithe_mutexattr_init(&attr);
+	lithe_mutex_init(&common_locks.ini_lock, &attr);
+	lithe_mutex_init(&common_locks.util_fabric_lock, &attr);
+}
+#else
+/* Initialize pthread mutexes statically */
 struct ofi_common_locks common_locks = {
 	.ini_lock = PTHREAD_MUTEX_INITIALIZER,
 	.util_fabric_lock = PTHREAD_MUTEX_INITIALIZER,
 };
+#endif
 
 int ofi_fork_unsafe;
 size_t ofi_universe_size = 1024;

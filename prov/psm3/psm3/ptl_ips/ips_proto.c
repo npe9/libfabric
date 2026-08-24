@@ -1664,7 +1664,7 @@ ips_proto_dma_wait_until(struct ips_proto *proto, ips_scb_t *scb)
 			 */
 			did_yield = 1;
 			spin_cnt = 0;
-			sched_yield();
+			yield();
 		}
 
 		err = psmi_hal_drain_sdma_completions(proto);

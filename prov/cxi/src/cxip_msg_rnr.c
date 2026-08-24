@@ -390,7 +390,7 @@ static int cxip_rxc_rnr_msg_init(struct cxip_rxc *rxc_base)
 
 	/* Wait for PTE state change */
 	do {
-		sched_yield();
+		cxip_yield();
 		cxip_evtq_progress(&rxc->base.rx_evtq, true);
 	} while (rxc->base.rx_pte->state != C_PTLTE_ENABLED);
 

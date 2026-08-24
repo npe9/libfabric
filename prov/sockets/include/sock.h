@@ -34,7 +34,11 @@
 
 #include "config.h"
 
+#if HAVE_LITHE
+#include <unix/osd.h>
+#else
 #include <pthread.h>
+#endif
 
 #include <rdma/fabric.h>
 #include <rdma/fi_atomic.h>
@@ -60,6 +64,35 @@
 #include <ofi_file.h>
 #include <ofi_osd.h>
 #include <ofi_util.h>
+
+#if HAVE_LITHE
+/* Include Lithe headers for concurrency primitives */
+#ifndef _LITHE_MUTEX_H_INCLUDED
+/* Save stdatomic's atomic_init before parlib redefines it */
+#ifdef atomic_init
+#undef atomic_init
+#endif
+/* Rename parlib's atomic_init function to avoid conflict */
+#define atomic_init __parlib_atomic_init_fn
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wnested-externs"
+#include <lithe/mutex.h>
+#include <lithe/condvar.h>
+#pragma GCC diagnostic pop
+
+/* Restore stdatomic's atomic_init */
+#undef atomic_init
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+#define atomic_init(PTR, VAL) __atomic_store_n(PTR, VAL, __ATOMIC_RELAXED)
+#endif
+#endif
+
+#define _LITHE_MUTEX_H_INCLUDED
+#endif
+#endif /* HAVE_LITHE */
 
 #ifndef _SOCK_H_
 #define _SOCK_H_
@@ -206,7 +239,11 @@ struct sock_conn_listener {
 	ofi_epoll_t epollfd;
 	struct fd_signal signal;
 	ofi_mutex_t signal_lock; /* acquire before map lock */
+#if HAVE_LITHE
+	ofi_thread_t listener_thread;
+#else
 	pthread_t listener_thread;
+#endif
 	int do_listen;
 	bool removed_from_epollfd;
 };
@@ -214,8 +251,12 @@ struct sock_conn_listener {
 struct sock_ep_cm_head {
 	ofi_epoll_t epollfd;
 	struct fd_signal signal;
-	pthread_mutex_t signal_lock;
+	ofi_mutex_t signal_lock;
+#if HAVE_LITHE
+	ofi_thread_t listener_thread;
+#else
 	pthread_t listener_thread;
+#endif
 	struct dlist_entry msg_list;
 	int do_listen;
 	bool removed_from_epollfd;
@@ -307,8 +348,13 @@ struct sock_cntr {
 	ofi_atomic32_t		ref;
 	ofi_atomic32_t		err_cnt;
 	ofi_atomic32_t		last_read_val;
-	pthread_cond_t 		cond;
+#if HAVE_LITHE
+	lithe_condvar_t		cond;
+	lithe_mutex_t		mut;
+#else
+	pthread_cond_t		cond;
 	pthread_mutex_t		mut;
+#endif
 	struct fi_cntr_attr	attr;
 
 	struct dlist_entry	rx_list;
@@ -382,8 +428,13 @@ struct sock_wait {
 	union {
 		int fd[2];
 		struct sock_mutex_cond {
+#if HAVE_LITHE
+			lithe_mutex_t	mutex;
+			lithe_condvar_t	cond;
+#else
 			pthread_mutex_t	mutex;
 			pthread_cond_t	cond;
+#endif
 		} mutex_cond;
 	} wobj;
 };
@@ -517,7 +568,11 @@ struct sock_pep_cm_entry {
 	int sock;
 	int do_listen;
 	int signal_fds[2];
+#if HAVE_LITHE
+	ofi_thread_t listener_thread;
+#else
 	pthread_t listener_thread;
+#endif
 };
 
 struct sock_ep_cm_entry {
@@ -846,7 +901,7 @@ struct sock_pe {
 	struct sock_pe_entry pe_table[SOCK_PE_MAX_ENTRIES];
 	ofi_mutex_t lock;
 	ofi_mutex_t signal_lock;
-	pthread_mutex_t list_lock;
+	ofi_mutex_t list_lock;
 	int wcnt, rcnt;
 	int signal_fds[2];
 	uint64_t waittime;
@@ -860,7 +915,11 @@ struct sock_pe {
 	struct dlist_entry tx_list;
 	struct dlist_entry rx_list;
 
+#if HAVE_LITHE
+	ofi_thread_t progress_thread;
+#else
 	pthread_t progress_thread;
+#endif
 	volatile int do_progress;
 	struct sock_pe_entry *pe_atomic;
 	ofi_epoll_t epoll_set;
@@ -887,8 +946,8 @@ struct sock_cq {
 	struct ofi_ringbuffd cq_rbfd;
 	struct ofi_ringbuf cqerr_rb;
 	struct dlist_entry overflow_list;
-	pthread_mutex_t lock;
-	pthread_mutex_t list_lock;
+	ofi_mutex_t lock;
+	ofi_mutex_t list_lock;
 
 	struct fid_wait *waitset;
 	int signal;
@@ -938,8 +997,13 @@ struct sock_conn_req_handle {
 	int sock_fd;
 	uint8_t monitored;
 	enum sock_conn_handle_state state;
+#if HAVE_LITHE
+	lithe_mutex_t	finalized_mutex;
+	lithe_condvar_t	finalized_cond;
+#else
 	pthread_mutex_t	finalized_mutex;
 	pthread_cond_t	finalized_cond;
+#endif
 	struct sock_pep *pep;
 	struct sock_ep *ep;
 	size_t paramlen;

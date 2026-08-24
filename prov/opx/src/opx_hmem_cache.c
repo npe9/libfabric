@@ -208,7 +208,7 @@ int opx_hmem_cache_init(struct util_domain *domain, struct ofi_mem_monitor **mon
 		return -FI_ENOSPC;
 	}
 
-	pthread_mutex_init(&cache->lock, NULL);
+	ofi_mr_cache_lock_init(cache);
 	dlist_init(&cache->lru_list);
 	dlist_init(&cache->dead_region_list);
 	cache->cached_cnt      = 0;
@@ -248,7 +248,7 @@ destroy:
 	OPX_TRACER_TRACE(OPX_TRACER_END_ERROR, "GDRCOPY-CACHE-INIT");
 	ofi_rbmap_cleanup(&cache->tree);
 	ofi_atomic_dec32(&cache->domain->ref);
-	pthread_mutex_destroy(&cache->lock);
+	ofi_mr_cache_lock_destroy(cache);
 	cache->domain = NULL;
 	cache->prov   = NULL;
 	return ret;
@@ -512,12 +512,12 @@ void opx_hmem_cache_delete_region(struct ofi_mr_cache *cache, struct ofi_mr_entr
 	       entry, opx_mr, iov_base, iov_len);
 	if (opx_mr->hmem_dev_reg_handle) {
 		/* Hold the cache->lock across unregister call */
-		pthread_mutex_lock(&cache->lock);
+		ofi_mr_cache_lock(cache);
 		assert(opx_mr->attr.iface == FI_HMEM_CUDA || opx_mr->attr.iface == FI_HMEM_ROCR);
 		OPX_TRACER_TRACE(OPX_TRACER_BEGIN, "GDRCOPY-DEV-UNREGISTER");
 		int err = ofi_hmem_dev_unregister(opx_mr->attr.iface, opx_mr->hmem_dev_reg_handle);
 		OPX_TRACER_TRACE(OPX_TRACER_END_SUCCESS, "GDRCOPY-DEV-UNREGISTER");
-		pthread_mutex_unlock(&cache->lock);
+		ofi_mr_cache_unlock(cache);
 		if (OFI_UNLIKELY(err)) {
 			FI_WARN(fi_opx_global.prov, FI_LOG_MR,
 				"Unable to de-register device reg handle, hmem_dev_reg_handle=%lu\n",

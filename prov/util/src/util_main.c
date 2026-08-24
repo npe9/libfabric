@@ -33,10 +33,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <ofi_util.h>
 #include <ofi.h>
 
+#if HAVE_LITHE
+#include <unix/osd.h>
+#endif
 static DEFINE_LIST(fabric_list);
 extern struct ofi_common_locks common_locks;
 
@@ -47,9 +51,9 @@ struct util_domain_match_arg {
 
 void ofi_fabric_insert(struct util_fabric *fabric)
 {
-	pthread_mutex_lock(&common_locks.util_fabric_lock);
+	ofi_mutex_lock_(&common_locks.util_fabric_lock);
 	dlist_insert_tail(&fabric->list_entry, &fabric_list);
-	pthread_mutex_unlock(&common_locks.util_fabric_lock);
+	ofi_mutex_unlock_(&common_locks.util_fabric_lock);
 }
 
 static int util_match_fabric(struct dlist_entry *item, const void *arg)
@@ -64,9 +68,9 @@ static int util_match_fabric(struct dlist_entry *item, const void *arg)
 
 void ofi_fabric_remove(struct util_fabric *fabric)
 {
-	pthread_mutex_lock(&common_locks.util_fabric_lock);
+	ofi_mutex_lock_(&common_locks.util_fabric_lock);
 	dlist_remove(&fabric->list_entry);
-	pthread_mutex_unlock(&common_locks.util_fabric_lock);
+	ofi_mutex_unlock_(&common_locks.util_fabric_lock);
 }
 
 
@@ -184,14 +188,15 @@ void util_lookup_existing_fabric_domain(const struct util_prov *util_prov,
 	struct util_domain *domain;
 	struct dlist_entry *item;
 	struct util_fabric_info fabric_info;
-
-	fabric_info.name =
-		(hints && hints->fabric_attr && hints->fabric_attr->name) ?
-			hints->fabric_attr->name :
-			(*info)->fabric_attr->name;
 	fabric_info.prov = util_prov->prov;
+	fabric_info.name = (*info)->fabric_attr ?
+			   (*info)->fabric_attr->name : NULL;
 
-	pthread_mutex_lock(&common_locks.util_fabric_lock);
+	if (!fabric_info.name) {
+		return;
+	}
+
+	ofi_mutex_lock_(&common_locks.util_fabric_lock);
 	item = dlist_find_first_match(&fabric_list, util_match_fabric,
 				      &fabric_info);
 	if (item) {
@@ -214,7 +219,7 @@ void util_lookup_existing_fabric_domain(const struct util_prov *util_prov,
 		ofi_mutex_unlock(&fabric->lock);
 
 	}
-	pthread_mutex_unlock(&common_locks.util_fabric_lock);
+	ofi_mutex_unlock_(&common_locks.util_fabric_lock);
 }
 
 static int ofi_dup_auth_keys(const struct fi_info *hints, struct fi_info *info)

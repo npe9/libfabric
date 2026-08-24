@@ -1340,7 +1340,11 @@ static int rxm_ep_ctrl(struct fid *fid, int command, void *arg)
 		 * opened to keep it simple (avoids progressing only MSG EQ first
 		 * and then progressing both MSG EQ and MSG CQ once the latter
 		 * is opened) */
+#if HAVE_LITHE
+		assert(!ep->cm_thread.context);
+#else
 		assert(!ep->cm_thread);
+#endif
 
 		ret = rxm_ep_msg_cq_open(ep);
 		if (ret)

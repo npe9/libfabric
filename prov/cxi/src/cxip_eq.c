@@ -114,7 +114,7 @@ static ssize_t cxip_eq_sread(struct fid_eq *eq_fid, uint32_t *event, void *buf,
 		if (ofi_adjust_timeout(endtime, &timeout))
 			return -FI_EAGAIN;
 
-		sched_yield();
+		cxip_yield();
 	} while (ret == -FI_EAGAIN);
 
 	return ret;

@@ -186,7 +186,11 @@ void *opx_progress_func(void *args)
 
 	FI_DBG(fi_opx_global.prov, FI_LOG_CQ, "Auto progress thread terminating, stopping thread\n");
 
+#if HAVE_LITHE
+	ofi_thread_exit(NULL);
+#else
 	pthread_exit(NULL);
+#endif
 }
 
 void *opx_progress_init(struct fi_opx_cq *cq, char *affinity)
@@ -207,6 +211,15 @@ void *opx_progress_init(struct fi_opx_cq *cq, char *affinity)
 			strerror(errno));
 		goto init_err;
 	}
+
+#if HAVE_LITHE
+	int thr_crt_rc = ofi_thread_create(&progress_thr->thread, opx_progress_func, (void *) progress_thr);
+	if (thr_crt_rc) {
+		FI_WARN(fi_opx_global.prov, FI_LOG_CQ,
+			"Auto progress thread creation error: ofi_thread_create returned %d\n", thr_crt_rc);
+		goto init_err;
+	}
+#else
 	pthread_attr_t thread_attr;
 	pthread_attr_init(&thread_attr);
 	opx_progress_set_affinity(&thread_attr, affinity);
@@ -218,6 +231,7 @@ void *opx_progress_init(struct fi_opx_cq *cq, char *affinity)
 			"Auto progress thread creation error: pthread_create returned %d\n", thr_crt_rc);
 		goto init_err;
 	}
+#endif
 	FI_INFO(fi_opx_global.prov, FI_LOG_CQ, "Auto progress thread started\n");
 
 	return (void *) progress_thr;
@@ -242,7 +256,11 @@ void opx_progress_stop(void *progress_thread_ptr)
 			rc, errno, strerror(errno));
 	}
 
+#if HAVE_LITHE
+	ofi_thread_join(&progress_thread->thread, NULL);
+#else
 	pthread_join(progress_thread->p_thread, NULL);
+#endif
 
 	close(progress_thread->event_fd);
 

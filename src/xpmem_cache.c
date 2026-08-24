@@ -35,8 +35,24 @@
 #endif /* HAVE_CONFIG_H */
 
 #include <ofi_xpmem.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #if HAVE_XPMEM
+
+static void ofi_xpmem_cache_trace(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (!getenv("OFI_DEBUG"))
+		return;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fflush(stderr);
+}
+
 static int xpmem_cache_add_region(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry)
 {
 	struct xpmem_addr *xpmem_addr = (struct xpmem_addr *) entry->info.handle;
@@ -63,11 +79,13 @@ static void xpmem_cache_delete_region(struct ofi_mr_cache *cache,
  */
 int ofi_xpmem_cache_open(struct ofi_mr_cache **cache)
 {
+	ofi_xpmem_cache_trace("[OFI_DEBUG] ofi_xpmem_cache_open: Starting\n");
 	struct ofi_mem_monitor *memory_monitors[OFI_HMEM_MAX] = {0};
 	int ret;
 
 	memory_monitors[FI_HMEM_SYSTEM] = xpmem_monitor;
 
+	ofi_xpmem_cache_trace("[OFI_DEBUG] ofi_xpmem_cache_open: Allocating cache\n");
 	*cache = calloc(1, sizeof(*(*cache)));
 	if (!*cache) {
 		ret = -FI_ENOMEM;
@@ -76,8 +94,11 @@ int ofi_xpmem_cache_open(struct ofi_mr_cache **cache)
 
 	(*cache)->add_region = xpmem_cache_add_region;
 	(*cache)->delete_region = xpmem_cache_delete_region;
+	ofi_xpmem_cache_trace("[OFI_DEBUG] ofi_xpmem_cache_open: Calling ofi_mr_cache_init\n");
 	ret = ofi_mr_cache_init(NULL, memory_monitors,
 				*cache);
+	ofi_xpmem_cache_trace("[OFI_DEBUG] ofi_xpmem_cache_open: Returned from ofi_mr_cache_init, ret=%d\n",
+			ret);
 	if (ret)
 		goto cleanup;
 
@@ -100,6 +121,11 @@ out:
  */
 void ofi_xpmem_cache_destroy(struct ofi_mr_cache *cache)
 {
+#if HAVE_LITHE
+	/* Ensure cleanup flag is set before cleanup - we're in base scheduler context */
+	extern volatile int ofi_cleanup_in_progress;
+	__atomic_store_n(&ofi_cleanup_in_progress, 1, __ATOMIC_RELEASE);
+#endif
 	ofi_mr_cache_cleanup(cache);
 	free(cache);
 }

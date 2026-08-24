@@ -39,7 +39,22 @@
 #include <ofi_mem.h>
 #include <ofi_mr.h>
 #include <ofi.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+/* Match fabric.c / util paths: only print when OFI_DEBUG is set. */
+static void ofi_xpmem_trace(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (!getenv("OFI_DEBUG"))
+		return;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fflush(stderr);
+}
 
 #define XPMEM_DEFAULT_MEMCPY_CHUNK_SIZE 262144
 struct ofi_xpmem *xpmem = NULL;
@@ -50,6 +65,7 @@ static struct ofi_mr_cache *xpmem_cache;
 
 int ofi_xpmem_init(void)
 {
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Starting\n");
 	/* Any attachment that goes past the Linux TASK_SIZE will always
 	 * fail. To prevent this we need to determine the value of
 	 * TASK_SIZE. On x86_64 the value was hard-coded in sm to be
@@ -68,14 +84,17 @@ int ofi_xpmem_init(void)
 	uintptr_t high;
 	char *tmp;
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Defining parameter\n");
 	fi_param_define(&core_prov, "xpmem_memcpy_chunksize", FI_PARAM_SIZE_T,
 			"Maximum size used for a single memcpy call. "
 			"(default: %d)", XPMEM_DEFAULT_MEMCPY_CHUNK_SIZE);
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Allocating xpmem struct\n");
 	xpmem = calloc(sizeof(*xpmem), 1);
 	if (!xpmem)
 		return -FI_ENOMEM;
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Opening /proc/self/maps\n");
 	fh = fopen("/proc/self/maps", "r");
 	if (NULL == fh) {
 		FI_WARN(&core_prov, FI_LOG_CORE,
@@ -84,6 +103,7 @@ int ofi_xpmem_init(void)
 		goto fail;
 	}
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Reading /proc/self/maps\n");
 	while (fgets(buffer, sizeof(buffer), fh)) {
 		/* each line of /proc/self/maps starts with low-high in
 		 * hexidecimal (without a 0x) */
@@ -93,6 +113,7 @@ int ofi_xpmem_init(void)
 			address_max = high;
 	}
 	fclose(fh);
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Finished reading /proc/self/maps\n");
 
 	if (address_max == 0) {
 		FI_WARN(&core_prov, FI_LOG_CORE,
@@ -104,6 +125,7 @@ int ofi_xpmem_init(void)
 	/* save the calcuated maximum */
 	xpmem->pinfo.address_max = address_max - 1;
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Calling xpmem_make\n");
 	/* export the process virtual address space for use with xpmem */
 	xpmem->pinfo.seg_id = xpmem_make(0, XPMEM_MAXADDR_SIZE, XPMEM_PERMIT_MODE,
 					 (void *) 0666);
@@ -113,17 +135,24 @@ int ofi_xpmem_init(void)
 		ret = -FI_ENODATA;
 		goto fail;
 	}
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: xpmem_make returned seg_id=%ld\n",
+			(long)xpmem->pinfo.seg_id);
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Getting parameter\n");
 	ret = fi_param_get_size_t(&core_prov, "xpmem_memcpy_chunksize",
 				  &xpmem->memcpy_chunk_size);
 	if (ret)
 		xpmem->memcpy_chunk_size = XPMEM_DEFAULT_MEMCPY_CHUNK_SIZE;
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Calling ofi_xpmem_cache_open\n");
 	ret = ofi_xpmem_cache_open(&xpmem_cache);
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Returned from ofi_xpmem_cache_open, ret=%d\n",
+			ret);
 	if (ret)
 		FI_WARN(&core_prov, FI_LOG_CORE,
 			"could not open xpmem cache");
 
+	ofi_xpmem_trace("[OFI_DEBUG] ofi_xpmem_init: Returning ret=%d\n", ret);
 	return ret;
 
 fail:
@@ -134,6 +163,11 @@ fail:
 
 int ofi_xpmem_cleanup(void)
 {
+#if HAVE_LITHE
+	/* Set cleanup flag before doing anything - we're in base scheduler context */
+	extern volatile int ofi_cleanup_in_progress;
+	__atomic_store_n(&ofi_cleanup_in_progress, 1, __ATOMIC_RELEASE);
+#endif
 	int ret = 0;
 
 	if (xpmem_cache)

@@ -38,7 +38,7 @@ static int cxip_rdzv_pte_wait_append(struct cxip_rdzv_pte *pte,
 	/* Poll until the LE is linked or a failure occurs. */
 	do {
 		cxip_evtq_progress(&pte->txc->base.tx_evtq, true);
-		sched_yield();
+		cxip_yield();
 	} while (!cxip_rdzv_pte_append_done(pte, expected_count));
 
 	if (ofi_atomic_get32(&pte->le_linked_failure_count)) {

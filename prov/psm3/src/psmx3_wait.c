@@ -38,9 +38,18 @@
  * impact, it only goes active during te time when wait calls are
  * blocked.
  */
+#if HAVE_LITHE
+static ofi_thread_t	psmx3_wait_thread;
+#else
 static pthread_t	psmx3_wait_thread;
+#endif
+#if HAVE_LITHE
+static lithe_mutex_t	psmx3_wait_mutex;
+static lithe_condvar_t	psmx3_wait_cond;
+#else
 static pthread_mutex_t	psmx3_wait_mutex;
 static pthread_cond_t	psmx3_wait_cond;
+#endif
 static volatile int	psmx3_wait_thread_ready = 0;
 static volatile int	psmx3_wait_thread_enabled = 0;
 static volatile int	psmx3_wait_thread_busy = 0;
@@ -63,24 +72,41 @@ static void *psmx3_wait_progress(void *args)
 	struct dlist_entry *item;
 
 	psmx3_wait_thread_ready = 1;
+#if HAVE_LITHE
+	/* In Lithe, condvar_wait already yields, so we don't need explicit cancellation */
+#else
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+#endif
 
 	while (1) {
+#if HAVE_LITHE
+		lithe_mutex_lock(&psmx3_wait_mutex);
+		if (!psmx3_wait_thread_enabled)
+			lithe_condvar_wait(&psmx3_wait_cond, &psmx3_wait_mutex);
+		lithe_mutex_unlock(&psmx3_wait_mutex);
+#else
 		pthread_mutex_lock(&psmx3_wait_mutex);
 		if (!psmx3_wait_thread_enabled)
 			pthread_cond_wait(&psmx3_wait_cond, &psmx3_wait_mutex);
 		pthread_mutex_unlock(&psmx3_wait_mutex);
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+#endif
 
 		psmx3_wait_thread_busy = 1;
 		while (psmx3_wait_thread_enabled) {
 			psmx3_lock(&fabric->domain_lock, 1);
 			dlist_foreach(&fabric->domain_list, item) {
 				domain = container_of(item, struct psmx3_fid_domain, entry);
+#if HAVE_LITHE
+				/* For Lithe, we can't easily compare contexts, so skip if progress thread is enabled */
+				if (domain->progress_thread_enabled && domain->progress_thread.context)
+					continue;
+#else
 				if (domain->progress_thread_enabled &&
 				    domain->progress_thread != pthread_self())
 					continue;
+#endif
 
 				psmx3_progress_all(domain);
 
@@ -88,11 +114,18 @@ static void *psmx3_wait_progress(void *args)
 					break;
 			}
 			psmx3_unlock(&fabric->domain_lock, 1);
+#if HAVE_LITHE
+			/* Yield periodically to allow other contexts to run (similar to allowing cancellation) */
+			lithe_context_yield();
+#endif
 		}
 
 		psmx3_wait_thread_busy = 0;
-
+#if HAVE_LITHE
+		/* In Lithe, we'll yield again when we wait on the condvar */
+#else
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+#endif
 	}
 
 	return NULL;
@@ -109,18 +142,63 @@ static void psmx3_wait_start_progress(struct psmx3_fid_fabric *fabric)
 	if (!fabric)
 		return;
 
+#if HAVE_LITHE
+	/* Wait threads should never be in the base scheduler - they need a child scheduler */
+	lithe_sched_t *current_sched = lithe_sched_current();
+	if (current_sched == NULL || current_sched->parent == NULL) {
+		/* In base scheduler - can't create wait thread, return */
+		return;
+	}
+#endif
+
 	psmx3_lock(&fabric->domain_lock, 1);
 	dlist_foreach(&fabric->domain_list, item) {
 		domain = container_of(item, struct psmx3_fid_domain, entry);
+#if HAVE_LITHE
+		/* For Lithe, we can't easily compare contexts, so run wait thread if progress thread is not enabled */
+		if (!domain->progress_thread_enabled || !domain->progress_thread.context)
+			run_wait_thread = 1;
+#else
 		if (!domain->progress_thread_enabled ||
 		    domain->progress_thread == pthread_self())
 			run_wait_thread = 1;
+#endif
 	}
 	psmx3_unlock(&fabric->domain_lock, 1);
 
 	if (!run_wait_thread)
 		return;
 
+#if HAVE_LITHE
+	if (!psmx3_wait_thread.context) {
+		lithe_mutexattr_t attr;
+		lithe_mutexattr_init(&attr);
+		lithe_mutex_init(&psmx3_wait_mutex, &attr);
+		lithe_condvar_init(&psmx3_wait_cond);
+		err = ofi_thread_create(&psmx3_wait_thread, psmx3_wait_progress, (void *)fabric);
+		if (err) {
+			PSMX3_WARN(&psmx3_prov, FI_LOG_EQ,
+				"cannot create wait progress thread\n");
+			/* If thread creation failed, don't wait forever */
+			return;
+		}
+		/* Wait for thread to be ready, yielding to allow scheduler to run it */
+		/* The thread should start quickly since we yielded in ofi_thread_create */
+		/* Keep yielding until the thread sets the ready flag */
+		int wait_count = 0;
+		const int max_wait = 10000; /* Allow more time for scheduler to run the thread */
+		while (!psmx3_wait_thread_ready && wait_count < max_wait) {
+			/* Yield to give the scheduler a chance to run the new context */
+			lithe_context_yield();
+			wait_count++;
+		}
+		if (!psmx3_wait_thread_ready) {
+			PSMX3_WARN(&psmx3_prov, FI_LOG_EQ,
+				"wait progress thread did not become ready after %d yields - scheduler may not be running\n", max_wait);
+			/* Continue anyway - the code should handle missing wait thread gracefully */
+		}
+	}
+#else
 	if (!psmx3_wait_thread) {
 		pthread_mutex_init(&psmx3_wait_mutex, NULL);
 		pthread_cond_init(&psmx3_wait_cond, NULL);
@@ -135,9 +213,14 @@ static void psmx3_wait_start_progress(struct psmx3_fid_fabric *fabric)
 		while (!psmx3_wait_thread_ready)
 			;
 	}
+#endif
 
 	psmx3_wait_thread_enabled = 1;
+#if HAVE_LITHE
+	lithe_condvar_signal(&psmx3_wait_cond);
+#else
 	pthread_cond_signal(&psmx3_wait_cond);
+#endif
 }
 
 static void psmx3_wait_stop_progress(void)

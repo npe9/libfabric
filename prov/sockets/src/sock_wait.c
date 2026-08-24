@@ -102,8 +102,14 @@ static int sock_wait_init(struct sock_wait *wait, enum fi_wait_obj type)
 		break;
 
 	case FI_WAIT_MUTEX_COND:
+#if HAVE_LITHE
+		/* Use Lithe's own concurrency primitives */
+		lithe_mutex_init(&wait->wobj.mutex_cond.mutex, NULL);
+		lithe_condvar_init(&wait->wobj.mutex_cond.cond);
+#else
 		pthread_mutex_init(&wait->wobj.mutex_cond.mutex, NULL);
 		pthread_cond_init(&wait->wobj.mutex_cond.cond, NULL);
+#endif
 		break;
 
 	default:
@@ -137,11 +143,11 @@ static int sock_wait_wait(struct fid_wait *wait_fid, int timeout)
 			cq = container_of(list_item->fid,
 					  struct sock_cq, cq_fid);
 			sock_cq_progress(cq);
-			pthread_mutex_lock(&cq->lock);
+			ofi_mutex_lock(&cq->lock);
 			if (ofi_rbused(&cq->cqerr_rb))
 				err = 1;
 
-			pthread_mutex_unlock(&cq->lock);
+			ofi_mutex_unlock(&cq->lock);
 			if (err)
 				return err;
 			break;
@@ -205,7 +211,11 @@ void sock_wait_signal(struct fid_wait *wait_fid)
 		break;
 
 	case FI_WAIT_MUTEX_COND:
+#if HAVE_LITHE
+		lithe_condvar_signal(&wait->wobj.mutex_cond.cond);
+#else
 		pthread_cond_signal(&wait->wobj.mutex_cond.cond);
+#endif
 		break;
 	default:
 		SOCK_LOG_ERROR("Invalid wait object type\n");

@@ -119,10 +119,30 @@ static inline uint64_t ofi_mr_get_prov_mode(uint32_t version,
 }
 
 /* Single lock used by all memory monitors and MR caches. */
+#if HAVE_LITHE
+extern lithe_mutex_t mm_lock;
+#else
 extern pthread_mutex_t mm_lock;
+#endif
 
 /* Lock used to coordinate monitor states. */
+#if HAVE_LITHE
+extern lithe_mutex_t mm_state_lock;
+/* Wrapper functions for mm_lock and mm_state_lock that check for base scheduler */
+void ofi_mm_lock_lock(void);
+void ofi_mm_lock_unlock(void);
+int ofi_mm_lock_trylock(void);
+void ofi_mm_state_lock_lock(void);
+void ofi_mm_state_lock_unlock(void);
+#else
 extern pthread_mutex_t mm_state_lock;
+/* Wrappers for consistent API - internal code uses these, not pthread directly */
+static inline void ofi_mm_lock_lock(void) { pthread_mutex_lock(&mm_lock); }
+static inline void ofi_mm_lock_unlock(void) { pthread_mutex_unlock(&mm_lock); }
+static inline int ofi_mm_lock_trylock(void) { return pthread_mutex_trylock(&mm_lock); }
+static inline void ofi_mm_state_lock_lock(void) { pthread_mutex_lock(&mm_state_lock); }
+static inline void ofi_mm_state_lock_unlock(void) { pthread_mutex_unlock(&mm_state_lock); }
+#endif
 
 /* The read-write lock is an additional lock used to protect the dlist_entry
  * list of ofi_mem_monitor. Due to the necessity of releasing the mm_lock
@@ -131,7 +151,15 @@ extern pthread_mutex_t mm_state_lock;
  * ofi_monitor_notify may be recursive and cannot block multiple walks from
  * occurring at the same time.
  */
+#if HAVE_LITHE
+extern lithe_mutex_t mm_list_rwlock;  /* Using mutex instead of rwlock - Lithe doesn't have rwlocks */
+/* Wrapper functions for mm_list_rwlock */
+void ofi_mm_list_lock(void);
+void ofi_mm_list_unlock(void);
+int ofi_mm_list_trylock(void);
+#else
 extern pthread_rwlock_t mm_list_rwlock;
+#endif
 
 /*
  * Memory notifier - Report memory mapping changes to address ranges
@@ -203,6 +231,13 @@ int ofi_monitor_import(struct fid *fid);
 int ofi_monitors_add_cache(struct ofi_mem_monitor **monitors,
 			   struct ofi_mr_cache *cache);
 void ofi_monitors_del_cache(struct ofi_mr_cache *cache);
+#if HAVE_LITHE
+/* Finalize-safe teardown: delist a cache and stop (cooperatively join) any
+ * now-idle memory-monitor evictor using the real Lithe mm locks, independent
+ * of ofi_cleanup_in_progress. Must be called before the cache tree is freed
+ * while the Lithe scheduler is still active. */
+void ofi_monitors_del_cache_lithe(struct ofi_mr_cache *cache);
+#endif
 void ofi_monitor_notify(struct ofi_mem_monitor *monitor,
 			const void *addr, size_t len);
 void ofi_monitor_flush(struct ofi_mem_monitor *monitor);
@@ -232,7 +267,11 @@ extern struct ofi_mem_monitor *default_ze_monitor;
  */
 struct ofi_uffd {
 	struct ofi_mem_monitor		monitor;
+#if HAVE_LITHE
+	ofi_thread_t			thread;
+#else
 	pthread_t			thread;
+#endif
 	int				fd;
 	int                             exit_pipe[2];
 };
@@ -257,7 +296,22 @@ struct kdreg2_status_data;
 
 struct ofi_kdreg2 {
 	struct ofi_mem_monitor          monitor;
+#if HAVE_LITHE
+	ofi_thread_t                    thread;
+	/* Set by the evictor Lithe context immediately before it returns, so a
+	 * teardown can cooperatively wait for it to truly exit before freeing
+	 * the MR-cache tree (the fork-join context self-destroys via the
+	 * scheduler context_exit hook; there is no blocking join for it). */
+	volatile int                    evictor_exited;
+	/* Aggregate epoll fd watching both the kdreg2 device fd and the exit
+	 * pipe. The evictor parks on this SINGLE fd via poll() -> __wrap_poll
+	 * -> parlib_reactor_wait, which yields the vcore. A 2-fd poll() cannot
+	 * be armed on the reactor and would fall back to a vcore-consuming
+	 * cooperative busy-loop that starves the rank's own contexts. */
+	int                             evictor_epfd;
+#else
 	pthread_t                       thread;
+#endif
 	int                             fd;
 	int                             exit_pipe[2];
 	const struct kdreg2_status_data *status_data;
@@ -406,7 +460,11 @@ struct ofi_mr_cache {
 	struct ofi_rbmap		tree;
 	struct dlist_entry		lru_list;
 	struct dlist_entry		dead_region_list;
+#if HAVE_LITHE
+	lithe_mutex_t			lock;
+#else
 	pthread_mutex_t			lock;
+#endif
 
 	size_t				cached_cnt;
 	size_t				cached_size;
@@ -425,6 +483,41 @@ struct ofi_mr_cache {
 	void				(*delete_region)(struct ofi_mr_cache *cache,
 							 struct ofi_mr_entry *entry);
 };
+
+#if HAVE_LITHE
+/* Helpers for ofi_mr_cache lock when HAVE_LITHE (providers use these instead of pthread_*) */
+static inline void ofi_mr_cache_lock(struct ofi_mr_cache *cache) {
+	lithe_mutex_lock(&cache->lock);
+}
+static inline void ofi_mr_cache_unlock(struct ofi_mr_cache *cache) {
+	lithe_mutex_unlock(&cache->lock);
+}
+static inline int ofi_mr_cache_trylock(struct ofi_mr_cache *cache) {
+	return lithe_mutex_trylock(&cache->lock);
+}
+static inline void ofi_mr_cache_lock_init(struct ofi_mr_cache *cache) {
+	lithe_mutex_init(&cache->lock, NULL);
+}
+static inline void ofi_mr_cache_lock_destroy(struct ofi_mr_cache *cache) {
+	(void)cache;
+}
+#else
+static inline void ofi_mr_cache_lock(struct ofi_mr_cache *cache) {
+	pthread_mutex_lock(&cache->lock);
+}
+static inline void ofi_mr_cache_unlock(struct ofi_mr_cache *cache) {
+	pthread_mutex_unlock(&cache->lock);
+}
+static inline int ofi_mr_cache_trylock(struct ofi_mr_cache *cache) {
+	return pthread_mutex_trylock(&cache->lock);
+}
+static inline void ofi_mr_cache_lock_init(struct ofi_mr_cache *cache) {
+	pthread_mutex_init(&cache->lock, NULL);
+}
+static inline void ofi_mr_cache_lock_destroy(struct ofi_mr_cache *cache) {
+	pthread_mutex_destroy(&cache->lock);
+}
+#endif
 
 int ofi_mr_cache_init(struct util_domain *domain,
 		      struct ofi_mem_monitor **monitors,

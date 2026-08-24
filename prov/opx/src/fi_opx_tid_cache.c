@@ -167,7 +167,7 @@ int opx_register_tid_region(uint64_t tid_vaddr, uint64_t tid_length, enum fi_hme
 	assert(tid_length == (tid_length & -(int64_t) OPX_TID_PAGE_SIZE[tid_iface]));
 
 	/* Assert precondition that the lock is held with a trylock assert */
-	assert(pthread_mutex_trylock(&opx_ep->tid_domain->tid_cache->lock) == EBUSY);
+	assert(ofi_mr_cache_trylock(opx_ep->tid_domain->tid_cache) == EBUSY);
 	FI_DBG(fi_opx_global.prov, FI_LOG_MR, "vaddr %p, length %lu\n", (void *) tid_vaddr, tid_length);
 
 	uint32_t length_chunk = (uint32_t) tid_length;
@@ -215,7 +215,7 @@ void opx_deregister_tid_region(struct fi_opx_ep *opx_ep, struct opx_mr_tid_info 
 	       (void *) tid_info->tid_vaddr, tid_info->tid_length, old_ntidinfo);
 
 	/* Assert precondition that the lock is held with a trylock assert */
-	assert(pthread_mutex_trylock(&opx_ep->tid_domain->tid_cache->lock) == EBUSY);
+	assert(ofi_mr_cache_trylock(opx_ep->tid_domain->tid_cache) == EBUSY);
 
 	opx_hfi1_wrapper_free_tid(opx_ep->hfi, (uint64_t) old_tidlist, old_ntidinfo);
 }
@@ -263,7 +263,7 @@ void opx_tid_cache_delete_region(struct ofi_mr_cache *cache, struct ofi_mr_entry
 	struct opx_tid_mr *opx_mr = (struct opx_tid_mr *) entry->data;
 
 	/* Assert precondition that the lock is held with a trylock assert */
-	assert(pthread_mutex_trylock(&opx_mr->opx_ep->tid_domain->tid_cache->lock) == EBUSY);
+	assert(ofi_mr_cache_trylock(opx_mr->opx_ep->tid_domain->tid_cache) == EBUSY);
 
 	FI_DBG(cache->domain->prov, FI_LOG_MR, "OPX_DEBUG_ENTRY entry %p, data %p opx_domain %p, endpoint %p\n", entry,
 	       opx_mr, opx_mr->domain, opx_mr->opx_ep);
@@ -370,7 +370,7 @@ int opx_tid_cache_init(struct util_domain *domain, struct ofi_mem_monitor **moni
 		return -FI_ENOSPC;
 	}
 
-	pthread_mutex_init(&cache->lock, NULL);
+	ofi_mr_cache_lock_init(cache);
 	dlist_init(&cache->lru_list);
 	dlist_init(&cache->dead_region_list);
 	cache->cached_cnt    = 0;
@@ -406,7 +406,7 @@ del:
 destroy:
 	ofi_rbmap_cleanup(&cache->tree);
 	ofi_atomic_dec32(&cache->domain->ref);
-	pthread_mutex_destroy(&cache->lock);
+	ofi_mr_cache_lock_destroy(cache);
 	cache->domain = NULL;
 	return ret;
 }
@@ -437,9 +437,9 @@ struct ofi_mr_entry *opx_mr_entry_alloc(struct ofi_mr_cache *cache)
 {
 	struct ofi_mr_entry *entry;
 
-	pthread_mutex_lock(&cache->lock);
+	ofi_mr_cache_lock(cache);
 	entry = ofi_buf_alloc(cache->entry_pool);
-	pthread_mutex_unlock(&cache->lock);
+	ofi_mr_cache_unlock(cache);
 
 	return entry;
 }
@@ -532,13 +532,13 @@ void opx_cache_free_entry(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry
 
 	assert(!entry->node);
 
-	pthread_mutex_lock(&cache->lock);
+	ofi_mr_cache_lock(cache);
 	opx_tid_cache_delete_region(cache, entry);
 	OPX_DEBUG_ENTRY((&entry->info));
 	OPX_DEBUG_ENTRY2(entry, OPX_TID_CACHE_ENTRY_FOUND);
 	FI_DBG(cache->domain->prov, FI_LOG_MR, "entry %p use_cnt %x\n", entry, entry->use_cnt);
 	OPX_BUF_FREE(entry);
-	pthread_mutex_unlock(&cache->lock);
+	ofi_mr_cache_unlock(cache);
 	OPX_DEBUG_EXIT(((struct ofi_mr_entry *) NULL), OPX_TID_CACHE_ENTRY_NOT_FOUND);
 	FI_DBG(cache->domain->prov, FI_LOG_MR, "OPX_DEBUG_EXIT\n");
 }
@@ -551,11 +551,11 @@ int opx_register_tid_region_retryable(struct ofi_mr_cache *cache, uint64_t tid_v
 	int ret;
 
 	/* Hold the cache->lock across registering the TIDs  */
-	pthread_mutex_lock(&cache->lock);
+	ofi_mr_cache_lock(cache);
 	{
 		ret = opx_register_tid_region(tid_vaddr, tid_length, tid_iface, tid_device, opx_ep, tid_info);
 	}
-	pthread_mutex_unlock(&cache->lock);
+	ofi_mr_cache_unlock(cache);
 
 	/* If no TIDs were available, flush the cache's dead list and retry.
 	   Note that we can only try flushing the dead list, and must NOT free
@@ -567,12 +567,12 @@ int opx_register_tid_region_retryable(struct ofi_mr_cache *cache, uint64_t tid_v
 		if (opx_tid_cache_flush_all(cache, false, false) > 0) {
 			FI_OPX_DEBUG_COUNTERS_INC(
 				opx_ep->debug_counters.expected_receive.tid_cache_flush_not_lru_helped);
-			pthread_mutex_lock(&cache->lock);
+			ofi_mr_cache_lock(cache);
 			{
 				ret = opx_register_tid_region(tid_vaddr, tid_length, tid_iface, tid_device, opx_ep,
 							      tid_info);
 			}
-			pthread_mutex_unlock(&cache->lock);
+			ofi_mr_cache_unlock(cache);
 		}
 	}
 
@@ -599,7 +599,7 @@ int opx_tid_cache_crte(struct ofi_mr_cache *cache, const struct ofi_mr_info *inf
 		       struct fi_opx_ep *opx_ep)
 {
 	/* Assert precondition that the lock is held with a trylock assert */
-	assert(pthread_mutex_trylock(&mm_lock) == EBUSY);
+	assert(ofi_mm_lock_trylock() == EBUSY);
 
 	struct ofi_mem_monitor *monitor = cache->monitors[info->iface];
 	assert(monitor);
@@ -621,13 +621,13 @@ int opx_tid_cache_crte(struct ofi_mr_cache *cache, const struct ofi_mr_info *inf
 
 	OPX_DEBUG_ENTRY(info);
 	/* drop the mm lock across alloc/register */
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
 	struct opx_mr_tid_info *tid_info;
 	int			ret = opx_mr_entry_alloc_init(cache, info, opx_ep, entry, &tid_info);
 	if (OFI_UNLIKELY(ret)) {
 		assert(ret == -FI_ENOMEM);
 		/* re-acquire mm_lock */
-		pthread_mutex_lock(&mm_lock);
+		ofi_mm_lock_lock();
 		return -FI_ENOMEM;
 	}
 
@@ -637,7 +637,7 @@ int opx_tid_cache_crte(struct ofi_mr_cache *cache, const struct ofi_mr_info *inf
 									  opx_ep, tid_info);
 
 	/* re-acquire mm_lock */
-	pthread_mutex_lock(&mm_lock);
+	ofi_mm_lock_lock();
 
 	if (ret) {
 		/* Failed, tid_info->ninfo will be zero */
@@ -694,10 +694,10 @@ int opx_tid_register_and_cache_entry(struct ofi_mr_cache *cache, const struct of
 	if (OFI_UNLIKELY(ret != FI_SUCCESS && (*entry) != NULL)) {
 		/*crte returns an entry even if tid update failed */
 		/* Unlock for free/return */
-		pthread_mutex_unlock(&mm_lock);
+		ofi_mm_lock_unlock();
 		opx_cache_free_entry(cache, *entry);
 		*entry = NULL;
-		pthread_mutex_lock(&mm_lock);
+		ofi_mm_lock_lock();
 	}
 
 	return ret;
@@ -993,7 +993,7 @@ int opx_tid_cache_close_region(struct ofi_mr_cache *tid_cache, struct ofi_mr_ent
 	/* TODO ... fix? */
 	OPX_DEBUG_ENTRY2(entry, OPX_TID_CACHE_ENTRY_FOUND);
 	/* Assert precondition that the lock is held with a trylock assert */
-	assert(pthread_mutex_trylock(&mm_lock) == EBUSY);
+	assert(ofi_mm_lock_trylock() == EBUSY);
 
 	// Start of opx_tid_cache_delete
 	FI_DBG(tid_cache->domain->prov, FI_LOG_MR, "OPX_DEBUG_ENTRY delete [%p - %p] (len: %zu,%#lX)\n",
@@ -1014,10 +1014,10 @@ int opx_tid_cache_close_region(struct ofi_mr_cache *tid_cache, struct ofi_mr_ent
 		if (!entry->node) {
 			tid_cache->uncached_cnt--;
 			tid_cache->uncached_size -= entry->info.iov.iov_len;
-			pthread_mutex_unlock(&mm_lock);
+			ofi_mm_lock_unlock();
 			opx_cache_free_entry(tid_cache, entry);
 			/* re-acquire mm_lock */
-			pthread_mutex_lock(&mm_lock);
+			ofi_mm_lock_lock();
 			return 0;
 		}
 		FI_DBG(tid_cache->domain->prov, FI_LOG_MR, "LRU entry %p\n", entry);
@@ -1285,7 +1285,7 @@ void opx_deregister_for_rzv(struct fi_opx_ep *opx_ep, const uint64_t tid_vaddr, 
 	FI_DBG(fi_opx_global.prov, FI_LOG_MR, "OPX_DEBUG_ENTRY tid vaddr [%#lx - %#lx] , tid length %lu/%#lX\n",
 	       tid_vaddr, tid_vaddr + tid_length, tid_length, tid_length);
 
-	pthread_mutex_lock(&mm_lock);
+	ofi_mm_lock_lock();
 
 	uintptr_t tid_end	   = (uintptr_t) (tid_vaddr + tid_length);
 	ssize_t	  remaining_length = tid_length;
@@ -1372,7 +1372,7 @@ void opx_deregister_for_rzv(struct fi_opx_ep *opx_ep, const uint64_t tid_vaddr, 
 	/* Flush the dead list, don't flush the lru list (false) */
 	opx_tid_cache_flush(tid_cache, false);
 	FI_DBG(fi_opx_global.prov, FI_LOG_MR, "OPX_DEBUG_EXIT %u entries closed\n", ncache_entries);
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
 }
 
 __OPX_FORCE_INLINE__
@@ -1394,7 +1394,7 @@ int opx_tid_get_tids_for_range(struct fi_opx_ep *opx_ep, struct fi_opx_hmem_iov 
 	find_info.iface	       = cur_tid_range.iface;
 	find_info.device       = cur_tid_range.device;
 
-	pthread_mutex_lock(&mm_lock);
+	ofi_mm_lock_lock();
 	enum opx_tid_cache_entry_status find = opx_tid_cache_find(opx_ep, &find_info, &entry);
 	if (OFI_UNLIKELY(find == OPX_TID_CACHE_ENTRY_IN_USE)) {
 		FI_OPX_DEBUG_COUNTERS_INC(opx_ep->debug_counters.expected_receive.tid_cache_found_entry_in_use);
@@ -1479,7 +1479,7 @@ int opx_tid_get_tids_for_range(struct fi_opx_ep *opx_ep, struct fi_opx_hmem_iov 
 	assert(ofi_iov_end(&tid_addr_block->target_iov) >= (void *) cur_addr_range->buf);
 
 register_end:
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
 	return ret;
 }
 
@@ -1575,7 +1575,7 @@ int opx_tid_cache_flush_all(struct ofi_mr_cache *cache, const bool flush_lru, co
 
 	dlist_init(&free_list);
 
-	pthread_mutex_lock(&mm_lock);
+	ofi_mm_lock_lock();
 
 	/*
 	 * Due to MR cache's deferred de-registration,
@@ -1626,7 +1626,7 @@ int opx_tid_cache_flush_all(struct ofi_mr_cache *cache, const bool flush_lru, co
 		flush_once = opx_tid_cache_full(cache);
 	}
 
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
 
 	int freed_entries = 0;
 	/* Free dead and selected lru entries */
@@ -1663,7 +1663,7 @@ void opx_tid_cache_purge_ep(struct ofi_mr_cache *cache, struct fi_opx_ep *opx_ep
 
 	dlist_init(&free_list);
 
-	pthread_mutex_lock(&mm_lock);
+	ofi_mm_lock_lock();
 
 	/*
 	 * Due to MR cache's deferred de-registration,
@@ -1742,7 +1742,7 @@ void opx_tid_cache_purge_ep(struct ofi_mr_cache *cache, struct fi_opx_ep *opx_ep
 			dlist_splice_tail(&cache->lru_list, &copy_lru_list);
 		}
 	}
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
 
 	/* Free dead and selected lru entries */
 	while (!dlist_empty(&free_list)) {
@@ -1776,7 +1776,7 @@ void opx_tid_cache_cleanup(struct ofi_mr_cache *cache)
 	/* Try forcing it (fini abnormal exit) for all eps (NULL) */
 	opx_tid_cache_purge_ep(cache, NULL);
 
-	pthread_mutex_destroy(&cache->lock);
+	ofi_mr_cache_lock_destroy(cache);
 	ofi_monitors_del_cache(cache);
 	ofi_rbmap_cleanup(&cache->tree);
 	ofi_atomic_dec32(&cache->domain->ref);

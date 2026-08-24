@@ -468,7 +468,7 @@ static void cxip_cntr_read_wb(struct cxip_cntr *cntr, struct c_ct_writeback *wb)
 		if (wb->ct_writeback || (cntr->attr.flags & FI_CXI_CNTR_CACHED))
 			break;
 		if (spin_before_yield == 0) {
-			sched_yield();
+			cxip_yield();
 			spin_before_yield = cxip_env.cntr_spin_before_yield;
 		} else {
 			CXIP_PAUSE();
@@ -661,7 +661,7 @@ static int cxip_cntr_wait(struct fid_cntr *fid_cntr, uint64_t threshold,
 			return -FI_ETIMEDOUT;
 
 		if (spin_before_yield == 0) {
-			sched_yield();
+			cxip_yield();
 			spin_before_yield = cxip_env.cntr_spin_before_yield;
 		} else {
 			CXIP_PAUSE();

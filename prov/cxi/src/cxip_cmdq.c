@@ -63,9 +63,9 @@ static int cxip_cp_get(struct cxip_lni *lni, uint16_t vni,
 	static const enum cxi_traffic_class remap_tc = CXI_TC_BEST_EFFORT;
 
 	/* Always prefer SW remapped CPs over allocating HW CP. */
-	pthread_rwlock_rdlock(&lni->cp_lock);
+	cxip_lni_cp_rdlock(lni);
 	ret = cxip_cp_find(lni, vni, tc, tc_type, cp, trig_cp);
-	pthread_rwlock_unlock(&lni->cp_lock);
+	cxip_lni_cp_unlock(lni);
 
 	if (ret == FI_SUCCESS)
 		return FI_SUCCESS;
@@ -73,7 +73,7 @@ static int cxip_cp_get(struct cxip_lni *lni, uint16_t vni,
 	/* Need to repeat search with write lock held to ensure no CPs have
 	 * been added in threaded env.
 	 */
-	pthread_rwlock_wrlock(&lni->cp_lock);
+	cxip_lni_cp_wrlock(lni);
 	ret = cxip_cp_find(lni, vni, tc, tc_type, cp, trig_cp);
 
 	if (ret == FI_SUCCESS)
@@ -163,14 +163,14 @@ found_hw_cp:
 	*cp = &sw_cp->remap_cp;
 
 success_unlock:
-	pthread_rwlock_unlock(&lni->cp_lock);
+	cxip_lni_cp_unlock(lni);
 
 	return FI_SUCCESS;
 
 err_free_sw_cp:
 	free(sw_cp);
 err_unlock:
-	pthread_rwlock_unlock(&lni->cp_lock);
+	cxip_lni_cp_unlock(lni);
 
 	return ret;
 }
@@ -222,7 +222,7 @@ int cxip_cmdq_cp_modify(struct cxip_cmdq *cmdq, uint16_t vni,
 	struct cxi_cp *hw_cp = NULL;
 	struct cxip_lni *lni = cmdq->lni;
 
-	pthread_rwlock_wrlock(&lni->cp_lock);
+	cxip_lni_cp_wrlock(lni);
 
 	/* find the hw CP that matches the sw CP */
 	for (i = 0; i < lni->n_cps; i++) {
@@ -240,7 +240,7 @@ int cxip_cmdq_cp_modify(struct cxip_cmdq *cmdq, uint16_t vni,
 		if (!ret) {
 			hw_cp->vni_pcp = vni;
 			cmdq->cur_cp->vni_pcp = vni;
-			pthread_rwlock_unlock(&lni->cp_lock);
+			cxip_lni_cp_unlock(lni);
 
 			return FI_SUCCESS;
 		}
@@ -248,7 +248,7 @@ int cxip_cmdq_cp_modify(struct cxip_cmdq *cmdq, uint16_t vni,
 		CXIP_WARN("cxil_modify_cp failed:%d\n", ret);
 	}
 
-	pthread_rwlock_unlock(&lni->cp_lock);
+	cxip_lni_cp_unlock(lni);
 
 	return -FI_ENOENT;
 #endif /* CXI_HAVE_MODIFY_CP */

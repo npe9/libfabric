@@ -710,9 +710,9 @@ int efa_mr_update_domain_mr_map(struct efa_mr *efa_mr, struct fi_mr_attr *mr_att
 
 	/* this can only happen when MR cache is enabled, hence the assertion */
 	assert(efa_mr->domain->cache);
-	pthread_mutex_lock(&mm_lock);
+	ofi_mm_lock_lock();
 	ofi_mr_cache_notify(efa_mr->domain->cache, existing_mr->ibv_mr->addr, existing_mr->ibv_mr->length);
-	pthread_mutex_unlock(&mm_lock);
+	ofi_mm_lock_unlock();
 
 	/* due to MR cache's deferred de-registration, ofi_mr_cache_notify() only move the region to dead_region_list
 	 * ofi_mr_cache_flush() will actually remove the region from cache.

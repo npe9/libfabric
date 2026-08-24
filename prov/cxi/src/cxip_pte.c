@@ -45,7 +45,7 @@ int cxip_pte_set_state_wait(struct cxip_pte *pte, struct cxip_cmdq *cmdq,
 	ret = cxip_pte_set_state(pte, cmdq, new_state, drop_count);
 	if (ret == FI_SUCCESS) {
 		do {
-			sched_yield();
+			cxip_yield();
 			cxip_evtq_progress(evtq, true);
 		} while (pte->state != new_state);
 	}

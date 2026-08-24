@@ -15,10 +15,92 @@
 
 #include "cxip.h"
 
+#if HAVE_LITHE
+#include <lithe/lithe.h>
+#endif
+
 #define CXIP_DBG(...) _CXIP_DBG(FI_LOG_DOMAIN, __VA_ARGS__)
 #define CXIP_WARN(...) _CXIP_WARN(FI_LOG_DOMAIN, __VA_ARGS__)
 
 extern struct fi_ops_mr cxip_dom_mr_ops;
+
+static int cxip_trig_op_wait(sem_t *sem, const struct timespec *deadline)
+{
+#if HAVE_LITHE
+	struct timespec now;
+
+	for (;;) {
+		if (sem_trywait(sem) == 0)
+			return FI_SUCCESS;
+
+		if (errno == EINTR)
+			continue;
+
+		if (errno != EAGAIN)
+			return -errno;
+
+		if (clock_gettime(CLOCK_REALTIME, &now) == -1)
+			return -errno;
+
+		if (now.tv_sec > deadline->tv_sec ||
+		    (now.tv_sec == deadline->tv_sec &&
+		     now.tv_nsec >= deadline->tv_nsec))
+			return -ETIMEDOUT;
+
+		/*
+		 * The semaphore is an interprocess CXI resource token, but the
+		 * wait must not park the Lithe worker thread.  Yield this Lithe
+		 * context so other MPI/OFI progress contexts can run on the vcore.
+		 */
+		lithe_context_yield();
+	}
+#else
+	bool again;
+
+	again = true;
+	do {
+		if (sem_timedwait(sem, deadline) == -1) {
+			if (errno == EINTR) {
+				CXIP_WARN("sem_timedwait failed: %d\n",
+					  -errno);
+				return -errno;
+			}
+		} else {
+			again = false;
+		}
+	} while (again);
+
+	return FI_SUCCESS;
+#endif
+}
+
+static void cxip_trig_cmdq_wait_empty(struct cxip_domain *dom)
+{
+#if HAVE_LITHE
+	for (;;) {
+		bool empty;
+
+		ofi_genlock_lock(&dom->trig_cmdq_lock);
+		empty = dom->trig_cmdq->dev_cmdq->status->rd_ptr ==
+			(dom->trig_cmdq->dev_cmdq->hw_wp32 / 2);
+		ofi_genlock_unlock(&dom->trig_cmdq_lock);
+
+		if (empty)
+			return;
+
+		/*
+		 * This is a hardware-completion wait, but spinning here burns the
+		 * rank's only vcore and can starve MPI/OFI progress contexts.
+		 */
+		lithe_context_yield();
+	}
+#else
+	ofi_genlock_lock(&dom->trig_cmdq_lock);
+	while (dom->trig_cmdq->dev_cmdq->status->rd_ptr !=
+	       (dom->trig_cmdq->dev_cmdq->hw_wp32 / 2)) {};
+	ofi_genlock_unlock(&dom->trig_cmdq_lock);
+#endif
+}
 
 static void cxip_domain_cmdq_free(struct cxip_domain *dom)
 {
@@ -996,7 +1078,6 @@ static int cxip_dom_dwq_queue_work(struct cxip_domain *dom,
 	int trig_op_count;
 	int trig_op_in_use;
 	struct timespec ts;
-	bool again;
 
 	ret = cxip_dom_dwq_queue_work_validate(dom, work);
 	if (ret != FI_SUCCESS)
@@ -1053,18 +1134,9 @@ static int cxip_dom_dwq_queue_work(struct cxip_domain *dom,
 
 		ts.tv_sec += DWQ_SEMAPHORE_TIMEOUT;
 
-		again = true;
-		do {
-			if (sem_timedwait(dom->trig_op_lock, &ts) == -1) {
-				if (errno == EINTR) {
-					CXIP_WARN("sem_timedwait failed: %d\n",
-						  -errno);
-					return -errno;
-				}
-			} else {
-				again = false;
-			}
-		} while (again);
+		ret = cxip_trig_op_wait(dom->trig_op_lock, &ts);
+		if (ret)
+			return ret;
 
 		ret = cxip_dom_trig_op_get_in_use(dom);
 		if (ret < 0) {
@@ -1159,12 +1231,8 @@ static int cxip_dom_dwq_queue_work(struct cxip_domain *dom,
 	 * has processed triggered operation commands. At this point, it is
 	 * safe to release the trigger op pool lock.
 	 */
-	if (cxip_env.enable_trig_op_limit) {
-		ofi_genlock_lock(&dom->trig_cmdq_lock);
-		while (dom->trig_cmdq->dev_cmdq->status->rd_ptr !=
-		       (dom->trig_cmdq->dev_cmdq->hw_wp32 / 2)) {};
-		ofi_genlock_unlock(&dom->trig_cmdq_lock);
-	}
+	if (cxip_env.enable_trig_op_limit)
+		cxip_trig_cmdq_wait_empty(dom);
 
 unlock:
 	if (cxip_env.enable_trig_op_limit)

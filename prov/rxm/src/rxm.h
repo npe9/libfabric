@@ -646,7 +646,11 @@ struct rxm_ep {
 	struct dlist_entry	loopback_list;
 	union ofi_sock_ip	addr;
 
+#if HAVE_LITHE
+	ofi_thread_t		cm_thread;
+#else
 	pthread_t		cm_thread;
+#endif
 	struct fid_pep 		*msg_pep;
 	struct fid_eq 		*msg_eq;
 	struct fid_ep 		*msg_srx;

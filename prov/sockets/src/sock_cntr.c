@@ -39,6 +39,35 @@
 #include <sys/types.h>
 
 #include "sock.h"
+
+#if HAVE_LITHE
+/* Include Lithe headers for concurrency primitives */
+#ifndef _LITHE_MUTEX_H_INCLUDED
+/* Save stdatomic's atomic_init before parlib redefines it */
+#ifdef atomic_init
+#undef atomic_init
+#endif
+/* Rename parlib's atomic_init function to avoid conflict */
+#define atomic_init __parlib_atomic_init_fn
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wnested-externs"
+#include <lithe/mutex.h>
+#include <lithe/condvar.h>
+#pragma GCC diagnostic pop
+
+/* Restore stdatomic's atomic_init */
+#undef atomic_init
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+#define atomic_init(PTR, VAL) __atomic_store_n(PTR, VAL, __ATOMIC_RELAXED)
+#endif
+#endif
+
+#define _LITHE_MUTEX_H_INCLUDED
+#endif
+#endif /* HAVE_LITHE */
 #include "sock_util.h"
 
 #include <ofi_util.h>
@@ -220,14 +249,26 @@ static uint64_t sock_cntr_read(struct fid_cntr *fid_cntr)
 
 void sock_cntr_inc(struct sock_cntr *cntr)
 {
-	pthread_mutex_lock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
 	ofi_atomic_inc32(&cntr->value);
 	if (ofi_atomic_get32(&cntr->num_waiting))
-		pthread_cond_broadcast(&cntr->cond);
+	#if HAVE_LITHE
+	lithe_condvar_broadcast(&cntr->cond);
+#else
+	pthread_cond_broadcast(&cntr->cond);
+#endif
 	if (cntr->signal)
 		sock_wait_signal(cntr->waitset);
 	sock_cntr_check_trigger_list(cntr);
-	pthread_mutex_unlock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 }
 
 static int sock_cntr_add(struct fid_cntr *fid_cntr, uint64_t value)
@@ -236,16 +277,28 @@ static int sock_cntr_add(struct fid_cntr *fid_cntr, uint64_t value)
 	struct sock_cntr *cntr;
 	cntr = container_of(fid_cntr, struct sock_cntr, cntr_fid);
 
-	pthread_mutex_lock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
 	new_val = ofi_atomic_add32(&cntr->value, (int32_t) value);
 	ofi_atomic_set32(&cntr->last_read_val, (int32_t) new_val);
 	if (ofi_atomic_get32(&cntr->num_waiting))
-		pthread_cond_broadcast(&cntr->cond);
+	#if HAVE_LITHE
+	lithe_condvar_broadcast(&cntr->cond);
+#else
+	pthread_cond_broadcast(&cntr->cond);
+#endif
 	if (cntr->signal)
 		sock_wait_signal(cntr->waitset);
 
 	sock_cntr_check_trigger_list(cntr);
-	pthread_mutex_unlock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 	return 0;
 }
 
@@ -255,16 +308,28 @@ static int sock_cntr_set(struct fid_cntr *fid_cntr, uint64_t value)
 	struct sock_cntr *cntr;
 	cntr = container_of(fid_cntr, struct sock_cntr, cntr_fid);
 
-	pthread_mutex_lock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
 	new_val = ofi_atomic_set32(&cntr->value, (int32_t) value);
 	ofi_atomic_set32(&cntr->last_read_val, (int32_t) new_val);
 	if (ofi_atomic_get32(&cntr->num_waiting))
-		pthread_cond_broadcast(&cntr->cond);
+	#if HAVE_LITHE
+	lithe_condvar_broadcast(&cntr->cond);
+#else
+	pthread_cond_broadcast(&cntr->cond);
+#endif
 	if (cntr->signal)
 		sock_wait_signal(cntr->waitset);
 
 	sock_cntr_check_trigger_list(cntr);
-	pthread_mutex_unlock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 	return 0;
 }
 
@@ -273,14 +338,26 @@ static int sock_cntr_adderr(struct fid_cntr *fid_cntr, uint64_t value)
 	struct sock_cntr *cntr;
 	cntr = container_of(fid_cntr, struct sock_cntr, cntr_fid);
 
-	pthread_mutex_lock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
 	ofi_atomic_add32(&cntr->err_cnt, (int32_t) value);
 	if (!cntr->err_flag)
 		cntr->err_flag = 1;
+#if HAVE_LITHE
+	lithe_condvar_signal(&cntr->cond);
+#else
 	pthread_cond_signal(&cntr->cond);
+#endif
 	if (cntr->signal)
 		sock_wait_signal(cntr->waitset);
-	pthread_mutex_unlock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 
 	return 0;
 }
@@ -290,14 +367,26 @@ static int sock_cntr_seterr(struct fid_cntr *fid_cntr, uint64_t value)
 	struct sock_cntr *cntr;
 
 	cntr = container_of(fid_cntr, struct sock_cntr, cntr_fid);
-	pthread_mutex_lock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
 	ofi_atomic_set32(&cntr->err_cnt, (int32_t) value);
 	if (!cntr->err_flag)
 		cntr->err_flag = 1;
+#if HAVE_LITHE
+	lithe_condvar_signal(&cntr->cond);
+#else
 	pthread_cond_signal(&cntr->cond);
+#endif
 	if (cntr->signal)
 		sock_wait_signal(cntr->waitset);
-	pthread_mutex_unlock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 
 	return 0;
 
@@ -311,7 +400,11 @@ static int sock_cntr_wait(struct fid_cntr *fid_cntr, uint64_t threshold,
 	struct sock_cntr *cntr;
 	cntr = container_of(fid_cntr, struct sock_cntr, cntr_fid);
 
-	pthread_mutex_lock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
 	if (cntr->err_flag) {
 		ret = -FI_EAVAIL;
 		goto out;
@@ -334,9 +427,17 @@ static int sock_cntr_wait(struct fid_cntr *fid_cntr, uint64_t threshold,
 
 	while (!ret && last_read < (int)threshold) {
 		if (cntr->domain->progress_mode == FI_PROGRESS_MANUAL) {
-			pthread_mutex_unlock(&cntr->mut);
+		#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 			ret = sock_cntr_progress(cntr);
-			pthread_mutex_lock(&cntr->mut);
+		#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
 		} else {
 			ret = ofi_wait_cond(&cntr->cond, &cntr->mut, (int) remaining_ms);
 		}
@@ -360,11 +461,19 @@ static int sock_cntr_wait(struct fid_cntr *fid_cntr, uint64_t threshold,
 	sock_cntr_check_trigger_list(cntr);
 	if (cntr->err_flag)
 		ret = -FI_EAVAIL;
-	pthread_mutex_unlock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 	return ret;
 
 out:
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
 	pthread_mutex_unlock(&cntr->mut);
+#endif
 	return ret;
 }
 
@@ -433,14 +542,30 @@ static int sock_cntr_close(struct fid *fid)
 	 * until we can acquire the mutex before proceeding.  This ensures
 	 * that the progress thread is no longer touching the counter.
 	 */
-	pthread_mutex_lock(&cntr->mut);
-	pthread_mutex_unlock(&cntr->mut);
+#if HAVE_LITHE
+	lithe_mutex_lock(&cntr->mut);
+#else
+	ofi_mutex_lock(&cntr->mut);
+#endif
+#if HAVE_LITHE
+	lithe_mutex_unlock(&cntr->mut);
+#else
+	ofi_mutex_unlock(&cntr->mut);
+#endif
 
-	pthread_mutex_destroy(&cntr->mut);
+#if HAVE_LITHE
+        /* Lithe mutexes don't need explicit destruction */
+#else
+        pthread_mutex_destroy(&cntr->mut);
+#endif
 	ofi_mutex_destroy(&cntr->list_lock);
 	ofi_mutex_destroy(&cntr->trigger_lock);
 
-	pthread_cond_destroy(&cntr->cond);
+#if HAVE_LITHE
+        /* Lithe condvars don't need explicit destruction */
+#else
+        pthread_cond_destroy(&cntr->cond);
+#endif
 	ofi_atomic_dec32(&cntr->domain->ref);
 	free(cntr);
 	return 0;
@@ -452,10 +577,22 @@ static uint64_t sock_cntr_readerr(struct fid_cntr *cntr)
 	_cntr = container_of(cntr, struct sock_cntr, cntr_fid);
 	if (_cntr->domain->progress_mode == FI_PROGRESS_MANUAL)
 		sock_cntr_progress(_cntr);
+#if HAVE_LITHE
+	lithe_mutex_lock(&_cntr->mut);
+#else
 	pthread_mutex_lock(&_cntr->mut);
+#endif
 	if (_cntr->err_flag)
 		_cntr->err_flag = 0;
-	pthread_mutex_unlock(&_cntr->mut);
+#if HAVE_LITHE
+        lithe_mutex_unlock(&_cntr->mut);
+#else
+#if HAVE_LITHE
+        lithe_mutex_unlock(&_cntr->mut);
+#else
+        pthread_mutex_unlock(&_cntr->mut);
+#endif
+#endif
 	return ofi_atomic_get32(&_cntr->err_cnt);
 }
 
@@ -520,7 +657,11 @@ int sock_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 	if (!_cntr)
 		return -FI_ENOMEM;
 
+#if HAVE_LITHE
+	ret = lithe_condvar_init(&_cntr->cond);
+#else
 	ret = pthread_cond_init(&_cntr->cond, NULL);
+#endif
 	if (ret)
 		goto err;
 
@@ -572,7 +713,11 @@ int sock_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
 		break;
 	}
 
+#if HAVE_LITHE
+	lithe_mutex_init(&_cntr->mut, NULL);
+#else
 	pthread_mutex_init(&_cntr->mut, NULL);
+#endif
 	ofi_mutex_init(&_cntr->list_lock);
 
 	ofi_atomic_initialize32(&_cntr->ref, 0);

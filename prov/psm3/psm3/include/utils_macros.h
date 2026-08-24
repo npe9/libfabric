@@ -94,5 +94,6 @@ typedef struct _atomic {
 #error "Unsupported compiler"
 #endif
 
-#define yield() sched_yield()
+#include "ofi_lithe_yield.h"
+#define yield() ofi_coop_yield()
 #endif /* UTILS_MACROS_H */

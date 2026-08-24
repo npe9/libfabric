@@ -65,6 +65,7 @@
 #include "utils_debug.h"
 #include "utils_user.h"
 #include "psm_user.h"
+#include "ptl_ips/ptl_fwd.h"
 
 #include <linux/idxd.h>
 #include <unistd.h>
@@ -913,7 +914,7 @@ static inline void psm3_dsa_pick_wq(void)
 		return;	// typical case, already picked one
 
 	// rcvthread, pick last and don't count it
-	if (pthread_equal(psm3_rcv_threadid, pthread_self())) {
+	if (psm3_ips_ptl_rcvthread_is_self()) {
 		sel = dsa_my_num_wqs-1;
 		_HFI_PRDBG("rcvthread picked wq %u: %s\n", sel, dsa_wqs[sel].wq_filename);
 		goto found;

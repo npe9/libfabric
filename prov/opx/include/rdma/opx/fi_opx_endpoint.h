@@ -595,8 +595,11 @@ OPX_COMPILE_TIME_ASSERT(offsetof(struct fi_opx_ep, common_info) == (FI_OPX_CACHE
 			"Offset of fi_opx_ep->hfi should start at cacheline 4!");
 OPX_COMPILE_TIME_ASSERT(offsetof(struct fi_opx_ep, init_send_cntr) == (FI_OPX_CACHE_LINE_SIZE * 5),
 			"Offset of fi_opx_ep->init_send_cntr should start at cacheline 5!");
+#if !HAVE_LITHE
+/* Lock offset varies with HAVE_LITHE: lithe_mutex_t is larger than pthread_spinlock_t */
 OPX_COMPILE_TIME_ASSERT(offsetof(struct fi_opx_ep, lock) == ((FI_OPX_CACHE_LINE_SIZE * 5) + 52),
 			"Offset of fi_opx_ep->lock should start before cacheline 6!");
+#endif
 
 /*
  * A 'scalable endpoint' may not be directly specified in a data movement

@@ -31,6 +31,8 @@
  */
 
 #include <assert.h>
+#include "config.h"
+#include "ofi_lithe_yield.h"
 #include "ucx.h"
 
 static ssize_t ucx_cq_sreadfrom(struct fid_cq *cq_fid, void *buf, size_t count,
@@ -57,7 +59,7 @@ static ssize_t ucx_cq_sreadfrom(struct fid_cq *cq_fid, void *buf, size_t count,
 			return -FI_EAGAIN;
 		}
 
-		sched_yield();
+		ofi_coop_yield();
 	}
 }
 

@@ -36,7 +36,11 @@
 
 #include <sys/types.h>
 #include <netdb.h>
+#if HAVE_LITHE
+#include <unix/osd.h>
+#else
 #include <pthread.h>
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -378,7 +382,11 @@ struct xnet_progress {
 	struct ofi_epollfds_event events[XNET_MAX_EVENTS];
 
 	bool			auto_progress;
+#if HAVE_LITHE
+	ofi_thread_t		thread;
+#else
 	pthread_t		thread;
+#endif
 };
 
 int xnet_init_progress(struct xnet_progress *progress, struct fi_info *info);

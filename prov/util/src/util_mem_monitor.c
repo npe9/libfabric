@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 /*
  * Copyright (c) 2017 Cray Inc. All rights reserved.
  * Copyright (c) 2017-2021 Intel Inc. All rights reserved.
@@ -39,10 +41,103 @@
 
 #include <ofi_mr.h>
 #include <ofi_mem.h>
+#include <ofi_osd.h>
 
+#if HAVE_LITHE
+lithe_mutex_t mm_lock;
+lithe_mutex_t mm_state_lock;
+
+/* Don't initialize Lithe mutexes in constructor - do it lazily when first used */
+/* Initialize memory monitor locks - called from ofi_init_lithe_scheduler() */
+void ofi_init_mem_monitor_locks(void) {
+	lithe_mutexattr_t attr;
+	lithe_mutexattr_init(&attr);
+	lithe_mutex_init(&mm_lock, &attr);
+	lithe_mutex_init(&mm_state_lock, &attr);
+	lithe_mutex_init(&mm_list_rwlock, &attr);  /* Initialize rwlock as mutex */
+}
+
+/* Wrapper functions for mm_lock and mm_state_lock that check for base scheduler */
+/* These functions skip locking if mutexes aren't initialized (e.g., during cleanup) */
+/* During cleanup/constructors, we're in base scheduler context - no mutexes needed */
+void ofi_mm_lock_lock(void) {
+	/* Check cleanup flag - if cleanup is in progress, never lock */
+	extern volatile int ofi_cleanup_in_progress;
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	
+	lithe_mutex_lock(&mm_lock);
+}
+
+void ofi_mm_lock_unlock(void) {
+	/* During cleanup flag, skip immediately - we're in base scheduler context */
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	lithe_mutex_unlock(&mm_lock);
+}
+
+int ofi_mm_lock_trylock(void) {
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return EBUSY;
+	}
+	return lithe_mutex_trylock(&mm_lock);
+}
+
+void ofi_mm_state_lock_lock(void) {
+	/* Check cleanup flag - if cleanup is in progress, never lock */
+	extern volatile int ofi_cleanup_in_progress;
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	
+	lithe_mutex_lock(&mm_state_lock);
+}
+
+void ofi_mm_state_lock_unlock(void) {
+	/* During cleanup flag, skip immediately */
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	lithe_mutex_unlock(&mm_state_lock);
+}
+
+/* Wrapper functions for mm_list_rwlock (using mutex since Lithe doesn't have rwlocks) */
+void ofi_mm_list_lock(void) {
+	/* Check cleanup flag - if cleanup is in progress, never lock */
+	extern volatile int ofi_cleanup_in_progress;
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	
+	lithe_mutex_lock(&mm_list_rwlock);
+}
+
+void ofi_mm_list_unlock(void) {
+	/* During cleanup flag, skip immediately */
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	lithe_mutex_unlock(&mm_list_rwlock);
+}
+
+int ofi_mm_list_trylock(void) {
+	/* During cleanup flag, skip immediately */
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		return EBUSY;
+	}
+	return lithe_mutex_trylock(&mm_list_rwlock);
+}
+#else
 pthread_mutex_t mm_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mm_state_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+#if HAVE_LITHE
+lithe_mutex_t mm_list_rwlock;  /* Using mutex instead of rwlock - Lithe doesn't have rwlocks */
+#else
 pthread_rwlock_t mm_list_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+#endif
 
 struct ofi_mem_monitor *default_monitor;
 struct ofi_mem_monitor *default_cuda_monitor;
@@ -104,7 +199,11 @@ static int ofi_monitors_update(struct ofi_mem_monitor **monitors)
 
 	assert(monitors);
 
+#if HAVE_LITHE
+	ofi_mm_state_lock_lock();
+#else
 	pthread_mutex_lock(&mm_state_lock);
+#endif
 	for (iface = 0; iface < OFI_HMEM_MAX; iface++) {
 		monitor = monitors[iface];
 		if (monitor == NULL)
@@ -139,7 +238,11 @@ static int ofi_monitors_update(struct ofi_mem_monitor **monitors)
 		}
 	}
 out:
+#if HAVE_LITHE
+	ofi_mm_state_lock_unlock();
+#else
 	pthread_mutex_unlock(&mm_state_lock);
+#endif
 	return ret;
 }
 
@@ -228,10 +331,21 @@ static void set_default_monitor(const char *monitor)
  */
 void ofi_monitors_init(void)
 {
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_monitors_init: Called\n");
+		fflush(stderr);
+	}
+#if !HAVE_LITHE
 	pthread_mutex_init(&mm_lock, NULL);
 	pthread_mutex_init(&mm_state_lock, NULL);
 	pthread_rwlock_init(&mm_list_rwlock, NULL);
+#endif
+	/* For HAVE_LITHE, locks are initialized in ofi_init_mem_monitor_locks() called from ofi_init_lithe_scheduler() */
 
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_monitors_init: Calling initialize_monitor_list()\n");
+		fflush(stderr);
+	}
 	initialize_monitor_list();
 
 	for (size_t i = 0; i < monitor_list_size; i++) {
@@ -334,6 +448,12 @@ void ofi_monitors_init(void)
 
 void ofi_monitors_cleanup(void)
 {
+#if HAVE_LITHE
+	/* During cleanup, we're in base scheduler context - skip all mutex operations */
+	/* Just clean up without locking - we're in single-threaded cleanup */
+	extern volatile int ofi_cleanup_in_progress;
+	ofi_cleanup_in_progress = 1;  /* Ensure flag is set */
+#endif
 	for (size_t i = 0; i < monitor_list_size; i++) {
 		FI_INFO(&core_prov, FI_LOG_MR,
 			"Cleaning up memory monitor %s\n",
@@ -343,15 +463,22 @@ void ofi_monitors_cleanup(void)
 
 	cleanup_monitor_list();
 
+#if !HAVE_LITHE
 	pthread_rwlock_destroy(&mm_list_rwlock);
 	pthread_mutex_destroy(&mm_state_lock);
 	pthread_mutex_destroy(&mm_lock);
+#endif
+	/* Lithe mutexes don't need explicit destruction */
 }
 
 /* Monitors array must be of size OFI_HMEM_MAX. */
 int ofi_monitors_add_cache(struct ofi_mem_monitor **monitors,
 			   struct ofi_mr_cache *cache)
 {
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_monitors_add_cache: Starting\n");
+		fflush(stderr);
+	}
 	struct ofi_mem_monitor *start_list[OFI_HMEM_MAX];
 	int ret = 0;
 	enum fi_hmem_iface iface;
@@ -364,8 +491,44 @@ int ofi_monitors_add_cache(struct ofi_mem_monitor **monitors,
 		return -FI_ENOSYS;
 	}
 
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_monitors_add_cache: Trying to acquire lock\n");
+		fflush(stderr);
+	}
+	int lock_acquired = 0;
+#if HAVE_LITHE
+	{
+		/* Loops until there are no readers or writers holding the lock */
+		int try_count = 0;
+		do {
+			try_count++;
+			if (getenv("OFI_DEBUG") && try_count % 1000 == 0) {
+				fprintf(stderr, "[OFI_DEBUG] ofi_monitors_add_cache: Still trying to acquire lock, count=%d\n", try_count);
+				fflush(stderr);
+			}
+			ret = ofi_mm_list_trylock();
+			if (ret && ret != EBUSY) {
+				FI_WARN(&core_prov, FI_LOG_MR,
+					"add_cache cannot obtain write lock, %d\n",
+					ret);
+				return ret;
+			}
+		} while (ret);
+		if (getenv("OFI_DEBUG")) {
+			fprintf(stderr, "[OFI_DEBUG] ofi_monitors_add_cache: Acquired lock after %d tries\n", try_count);
+			fflush(stderr);
+		}
+		lock_acquired = 1; /* Successfully acquired lock */
+	}
+#else
 	/* Loops until there are no readers or writers holding the lock */
+	int try_count = 0;
 	do {
+		try_count++;
+		if (getenv("OFI_DEBUG") && try_count % 1000 == 0) {
+			fprintf(stderr, "[OFI_DEBUG] ofi_monitors_add_cache: Still trying to acquire lock, count=%d\n", try_count);
+			fflush(stderr);
+		}
 		ret = pthread_rwlock_trywrlock(&mm_list_rwlock);
 		if (ret && ret != EBUSY) {
 			FI_WARN(&core_prov, FI_LOG_MR,
@@ -374,6 +537,12 @@ int ofi_monitors_add_cache(struct ofi_mem_monitor **monitors,
 			return ret;
 		}
 	} while (ret);
+	if (getenv("OFI_DEBUG")) {
+		fprintf(stderr, "[OFI_DEBUG] ofi_monitors_add_cache: Acquired lock after %d tries\n", try_count);
+		fflush(stderr);
+	}
+	lock_acquired = 1; /* Successfully acquired lock */
+#endif
 
 	for (iface = FI_HMEM_SYSTEM; iface < OFI_HMEM_MAX; iface++) {
 		cache->monitors[iface] = NULL;
@@ -390,14 +559,22 @@ int ofi_monitors_add_cache(struct ofi_mem_monitor **monitors,
 		}
 
 		if (dlist_empty(&monitor->list)) {
+#if HAVE_LITHE
+			ofi_mm_state_lock_lock();
+#else
 			pthread_mutex_lock(&mm_state_lock);
+#endif
 			start_list[iface] = monitor;
 			/* See comment above ofi_monitors_update for details */
 			if (monitor->state == FI_MM_STATE_IDLE)
 				monitor->state = FI_MM_STATE_STARTING;
 			else if (monitor->state == FI_MM_STATE_STOPPING)
 				monitor->state = FI_MM_STATE_RUNNING;
+#if HAVE_LITHE
+			ofi_mm_state_lock_unlock();
+#else
 			pthread_mutex_unlock(&mm_state_lock);
+#endif
 		}
 
 		success_count++;
@@ -405,7 +582,14 @@ int ofi_monitors_add_cache(struct ofi_mem_monitor **monitors,
 		dlist_insert_tail(&cache->notify_entries[iface],
 				  &monitor->list);
 	}
-	pthread_rwlock_unlock(&mm_list_rwlock);
+	/* Only unlock if we actually acquired the lock */
+	if (lock_acquired) {
+#if HAVE_LITHE
+		ofi_mm_list_unlock();
+#else
+		pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
+	}
 
 	ret = ofi_monitors_update(start_list);
 	if (ret)
@@ -424,7 +608,33 @@ void ofi_monitors_del_cache(struct ofi_mr_cache *cache)
 	struct ofi_mem_monitor *monitor;
 	enum fi_hmem_iface iface;
 	int ret;
+	int lock_acquired = 0;
 
+#if HAVE_LITHE
+	/* During cleanup, skip all mutex operations */
+	extern volatile int ofi_cleanup_in_progress;
+	if (__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+		/* In cleanup - skip all mutex operations */
+		lock_acquired = 0;
+		/* Just clear the monitors without locking */
+		for (iface = 0; iface < OFI_HMEM_MAX; iface++) {
+			cache->monitors[iface] = NULL;
+		}
+		return;
+	} else {
+		/* Loops until there are no readers or writers holding the lock */
+		do {
+			ret = ofi_mm_list_trylock();
+			if (ret && ret != EBUSY) {
+				FI_WARN(&core_prov, FI_LOG_MR,
+					"del_cache cannot obtain write lock, %d\n",
+					ret);
+				return;
+			}
+		} while (ret);
+		lock_acquired = 1; /* Successfully acquired lock */
+	}
+#else
 	/* Loops until there are no readers or writers holding the lock */
 	do {
 		ret = pthread_rwlock_trywrlock(&mm_list_rwlock);
@@ -435,6 +645,8 @@ void ofi_monitors_del_cache(struct ofi_mr_cache *cache)
 			return;
 		}
 	} while (ret);
+	lock_acquired = 1; /* Successfully acquired lock */
+#endif
 
 	for (iface = 0; iface < OFI_HMEM_MAX; iface++) {
 		update_list[iface] = NULL;
@@ -445,7 +657,11 @@ void ofi_monitors_del_cache(struct ofi_mr_cache *cache)
 		dlist_remove(&cache->notify_entries[iface]);
 
 		if (dlist_empty(&monitor->list)) {
+#if HAVE_LITHE
+			ofi_mm_state_lock_lock();
+#else
 			pthread_mutex_lock(&mm_state_lock);
+#endif
 			/* See comment above ofi_monitors_update for details */
 			if (monitor->state == FI_MM_STATE_RUNNING) {
 				monitor->state = FI_MM_STATE_STOPPING;
@@ -454,18 +670,91 @@ void ofi_monitors_del_cache(struct ofi_mr_cache *cache)
 				monitor->state = FI_MM_STATE_RUNNING;
 				update_list[iface] = monitor;
 			}
+#if HAVE_LITHE
+			/* Skip mutex if in cleanup */
+			if (!__atomic_load_n(&ofi_cleanup_in_progress, __ATOMIC_ACQUIRE)) {
+				ofi_mm_state_lock_unlock();
+			}
+#else
 			pthread_mutex_unlock(&mm_state_lock);
+#endif
 		}
 
 		cache->monitors[iface] = NULL;
 	}
 
-	pthread_rwlock_unlock(&mm_list_rwlock);
-
+	/* Only unlock if we actually acquired the lock */
+	if (lock_acquired) {
+#if HAVE_LITHE
+		ofi_mm_list_unlock();
+#else
+		pthread_rwlock_unlock(&mm_list_rwlock);
+#endif
+	}
 
 	ofi_monitors_update(update_list);
 	return;
 }
+
+#if HAVE_LITHE
+/* Lithe-only, finalize-safe variant of ofi_monitors_del_cache().
+ *
+ * Unlike ofi_monitors_del_cache(), this does NOT consult
+ * ofi_cleanup_in_progress. By the time an MR cache is torn down during
+ * finalize that flag is already set (libfabric atexit / fabric fini), which
+ * would otherwise make the stock path early-return -- leaving the evictor
+ * linked -- and turn every ofi_mm_* lock into a no-op -- leaving the evictor's
+ * tree walk unserialized. The kdreg2/uffd/memhooks evictor is a Lithe context
+ * that only ever runs while the scheduler is active, so we synchronize with it
+ * using the REAL Lithe mm locks (same lock set and order the evictor's notify
+ * path uses) and stop (cooperatively join) any monitor that no longer serves a
+ * cache, guaranteeing no context can touch this cache's rbmap once we return. */
+void ofi_monitors_del_cache_lithe(struct ofi_mr_cache *cache)
+{
+	struct ofi_mem_monitor *stop_list[OFI_HMEM_MAX];
+	struct ofi_mem_monitor *monitor;
+	enum fi_hmem_iface iface;
+
+	/* Serialize against the evictor's notify path, which takes
+	 * mm_list_rwlock then mm_lock. Holding both here means no evictor can
+	 * be iterating monitor->list or walking a cache tree while we delist. */
+	lithe_mutex_lock(&mm_list_rwlock);
+	lithe_mutex_lock(&mm_lock);
+	lithe_mutex_lock(&mm_state_lock);
+	for (iface = 0; iface < OFI_HMEM_MAX; iface++) {
+		stop_list[iface] = NULL;
+		monitor = cache->monitors[iface];
+		if (!monitor)
+			continue;
+
+		dlist_remove(&cache->notify_entries[iface]);
+		cache->monitors[iface] = NULL;
+
+		if (dlist_empty(&monitor->list) &&
+		    monitor->state == FI_MM_STATE_RUNNING) {
+			monitor->state = FI_MM_STATE_STOPPING;
+			stop_list[iface] = monitor;
+		}
+	}
+	lithe_mutex_unlock(&mm_state_lock);
+	lithe_mutex_unlock(&mm_lock);
+	lithe_mutex_unlock(&mm_list_rwlock);
+
+	/* Stop (cooperatively join) evictors outside the mm locks. The evictor
+	 * checks its exit pipe before taking any lock, so signaling it while we
+	 * hold no mm lock cannot deadlock; kdreg2_monitor_stop() then yields the
+	 * hart until the context has actually exited. */
+	for (iface = 0; iface < OFI_HMEM_MAX; iface++) {
+		monitor = stop_list[iface];
+		if (!monitor)
+			continue;
+		monitor->stop(monitor);
+		lithe_mutex_lock(&mm_state_lock);
+		monitor->state = FI_MM_STATE_IDLE;
+		lithe_mutex_unlock(&mm_state_lock);
+	}
+}
+#endif
 
 /* Must be called with locks in place like following
  *	pthread_rwlock_rdlock(&mm_list_rwlock);
@@ -498,9 +787,15 @@ void ofi_monitor_flush(struct ofi_mem_monitor *monitor)
 
 	dlist_foreach_container(&monitor->list, struct ofi_mr_cache,
 				cache, notify_entries[monitor->iface]) {
+#if HAVE_LITHE
+		ofi_mm_lock_unlock();
+		ofi_mr_cache_flush(cache, false);
+		ofi_mm_lock_lock();
+#else
 		pthread_mutex_unlock(&mm_lock);
 		ofi_mr_cache_flush(cache, false);
 		pthread_mutex_lock(&mm_lock);
+#endif
 	}
 }
 

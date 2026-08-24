@@ -33,8 +33,13 @@
 #ifndef _FI_PROV_OPX_PROGRESS_H_
 #define _FI_PROV_OPX_PROGRESS_H_
 
-#include <pthread.h>
 #include "rdma/opx/fi_opx_eq.h"
+
+#if HAVE_LITHE
+#include <unix/osd.h>
+#else
+#include <pthread.h>
+#endif
 
 #define OPX_PROGRESS_CQ_WAIT_USEC (200)
 
@@ -42,7 +47,11 @@ static const uint64_t OPX_PROGRESS_EVENT_TERMINATE = 0xD1Eul;
 
 struct opx_progress_thread {
 	struct fi_opx_cq *cq;
+#if HAVE_LITHE
+	ofi_thread_t	  thread;
+#else
 	pthread_t	  p_thread;
+#endif
 	int		  event_fd;
 };
 

@@ -160,7 +160,15 @@ static int sock_ep_cm_setname(fid_t fid, void *addr, size_t addrlen)
 		return sock_conn_listen(sock_ep->attr);
 	case FI_CLASS_PEP:
 		sock_pep = container_of(fid, struct sock_pep, pep.fid);
+#if HAVE_LITHE
+#if HAVE_LITHE
+		if (sock_pep->cm.listener_thread.context)
+#else
 		if (sock_pep->cm.listener_thread)
+#endif
+#else
+		if (sock_pep->cm.listener_thread)
+#endif
 			return -FI_EINVAL;
 		memcpy(&sock_pep->src_addr, addr, addrlen);
 		return sock_pep_create_listener(sock_pep);
@@ -227,7 +235,7 @@ static void sock_ep_cm_monitor_handle(struct sock_ep_cm_head *cm_head,
 {
 	int ret;
 
-	pthread_mutex_lock(&cm_head->signal_lock);
+	ofi_mutex_lock(&cm_head->signal_lock);
 	if (handle->monitored)
 		goto unlock;
 
@@ -243,7 +251,7 @@ static void sock_ep_cm_monitor_handle(struct sock_ep_cm_head *cm_head,
 		fd_signal_set(&cm_head->signal);
 	}
 unlock:
-	pthread_mutex_unlock(&cm_head->signal_lock);
+	ofi_mutex_unlock(&cm_head->signal_lock);
 }
 
 static void
@@ -276,9 +284,9 @@ static void sock_ep_cm_unmonitor_handle(struct sock_ep_cm_head *cm_head,
                                        struct sock_conn_req_handle *handle,
                                        int close_socket)
 {
-	pthread_mutex_lock(&cm_head->signal_lock);
+	ofi_mutex_lock(&cm_head->signal_lock);
 	sock_ep_cm_unmonitor_handle_locked(cm_head, handle, close_socket);
-	pthread_mutex_unlock(&cm_head->signal_lock);
+	ofi_mutex_unlock(&cm_head->signal_lock);
 }
 
 static void sock_ep_cm_shutdown_report(struct sock_ep *ep, int send_shutdown)
@@ -448,8 +456,13 @@ static struct sock_conn_req_handle *sock_ep_cm_new_handle(void)
 
 	handle = calloc(1, sizeof(*handle));
 	if (handle) {
+#if HAVE_LITHE
+		lithe_mutex_init(&handle->finalized_mutex, NULL);
+		lithe_condvar_init(&handle->finalized_cond);
+#else
 		pthread_mutex_init(&handle->finalized_mutex, NULL);
 		pthread_cond_init(&handle->finalized_cond, NULL);
+#endif
 		handle->state = SOCK_CONN_HANDLE_ACTIVE;
 	}
 	return handle;
@@ -696,8 +709,16 @@ static int sock_pep_fi_close(fid_t fid)
 	if (ret != 1)
 		SOCK_LOG_DBG("Failed to signal\n");
 
-	if (pep->cm.listener_thread &&
+#if HAVE_LITHE
+        if (pep->cm.listener_thread.context &&
+#else
+        if (0 &&
+#endif
+#if HAVE_LITHE
+	    ofi_thread_join(&pep->cm.listener_thread, NULL)) {
+#else
 	    pthread_join(pep->cm.listener_thread, NULL)) {
+#endif
 		SOCK_LOG_DBG("pthread join failed\n");
 	}
 
@@ -739,9 +760,9 @@ static struct fi_info *sock_ep_msg_get_info(struct sock_pep *pep,
 
 void sock_ep_cm_signal(struct sock_ep_cm_head *cm_head)
 {
-	pthread_mutex_lock(&cm_head->signal_lock);
+	ofi_mutex_lock(&cm_head->signal_lock);
 	fd_signal_set(&cm_head->signal);
-	pthread_mutex_unlock(&cm_head->signal_lock);
+	ofi_mutex_unlock(&cm_head->signal_lock);
 }
 
 static void sock_ep_cm_process_rejected(struct sock_ep_cm_head *cm_head,
@@ -782,10 +803,17 @@ static void sock_ep_cm_process_finalizing(struct sock_ep_cm_head *cm_head,
 {
 	sock_ep_cm_unmonitor_handle(cm_head, hreq, 1);
 
+#if HAVE_LITHE
+	lithe_mutex_lock(&hreq->finalized_mutex);
+	hreq->state = SOCK_CONN_HANDLE_FINALIZED;
+	lithe_condvar_signal(&hreq->finalized_cond);
+	lithe_mutex_unlock(&hreq->finalized_mutex);
+#else
 	pthread_mutex_lock(&hreq->finalized_mutex);
 	hreq->state = SOCK_CONN_HANDLE_FINALIZED;
 	pthread_cond_signal(&hreq->finalized_cond);
 	pthread_mutex_unlock(&hreq->finalized_mutex);
+#endif
 }
 
 static struct sock_conn_req_handle *
@@ -794,13 +822,13 @@ sock_ep_cm_pop_from_msg_list(struct sock_ep_cm_head *cm_head)
 	struct dlist_entry *entry;
 	struct sock_conn_req_handle *hreq = NULL;
 
-	pthread_mutex_lock(&cm_head->signal_lock);
+	ofi_mutex_lock(&cm_head->signal_lock);
 	if (!dlist_empty(&cm_head->msg_list)) {
 		entry = cm_head->msg_list.next;
 		dlist_remove(entry);
 		hreq = container_of(entry, struct sock_conn_req_handle, entry);
 	}
-	pthread_mutex_unlock(&cm_head->signal_lock);
+	ofi_mutex_unlock(&cm_head->signal_lock);
 	return hreq;
 }
 
@@ -966,8 +994,12 @@ static void *sock_pep_listener_thread(void *data)
 
 static int sock_pep_start_listener_thread(struct sock_pep *pep)
 {
+#if HAVE_LITHE
+	if (ofi_thread_create(&pep->cm.listener_thread, sock_pep_listener_thread, (void *)pep)) {
+#else
 	if (pthread_create(&pep->cm.listener_thread, NULL,
 			   sock_pep_listener_thread, (void *)pep)) {
+#endif
 		SOCK_LOG_ERROR("Couldn't create listener thread\n");
 		return -FI_EINVAL;
 	}
@@ -978,7 +1010,15 @@ static int sock_pep_listen(struct fid_pep *pep)
 {
 	struct sock_pep *_pep;
 	_pep = container_of(pep, struct sock_pep, pep);
+#if HAVE_LITHE
+#if HAVE_LITHE
+	if (_pep->cm.listener_thread.context)
+#else
 	if (_pep->cm.listener_thread)
+#endif
+#else
+	if (_pep->cm.listener_thread)
+#endif
 		return 0;
 
 	if (sock_ep_cm_start_thread(&_pep->cm_head)) {
@@ -1017,9 +1057,9 @@ static int sock_pep_reject(struct fid_pep *pep, fid_t handle,
 
 	cm_head = &_pep->cm_head;
 	hreq->state = SOCK_CONN_HANDLE_REJECTED;
-	pthread_mutex_lock(&cm_head->signal_lock);
+	ofi_mutex_lock(&cm_head->signal_lock);
 	sock_ep_cm_add_to_msg_list(cm_head, hreq);
-	pthread_mutex_unlock(&cm_head->signal_lock);
+	ofi_mutex_unlock(&cm_head->signal_lock);
 	return 0;
 }
 
@@ -1189,7 +1229,7 @@ static void *sock_ep_cm_thread(void *arg)
 			continue;
 		}
 
-		pthread_mutex_lock(&cm_head->signal_lock);
+		ofi_mutex_lock(&cm_head->signal_lock);
 		if (cm_head->removed_from_epollfd) {
 			/* If we removed a socket from the epollfd after
 			 * ofi_epoll_wait returned, we can hit a use after
@@ -1221,7 +1261,7 @@ static void *sock_ep_cm_thread(void *arg)
 			sock_ep_cm_handle_rx(cm_head, handle);
 		}
 skip:
-		pthread_mutex_unlock(&cm_head->signal_lock);
+		ofi_mutex_unlock(&cm_head->signal_lock);
 	}
 	return NULL;
 }
@@ -1231,7 +1271,7 @@ int sock_ep_cm_start_thread(struct sock_ep_cm_head *cm_head)
 {
 	assert(cm_head->do_listen == 0);
 
-	pthread_mutex_init(&cm_head->signal_lock, NULL);
+	ofi_mutex_init(&cm_head->signal_lock);
 	dlist_init(&cm_head->msg_list);
 
 	int ret = ofi_epoll_create(&cm_head->epollfd);
@@ -1257,8 +1297,12 @@ int sock_ep_cm_start_thread(struct sock_ep_cm_head *cm_head)
 
 	cm_head->do_listen = 1;
 	cm_head->removed_from_epollfd = false;
+#if HAVE_LITHE
+	ret = ofi_thread_create(&cm_head->listener_thread, sock_ep_cm_thread, cm_head);
+#else
 	ret = pthread_create(&cm_head->listener_thread, 0,
 	                     sock_ep_cm_thread, cm_head);
+#endif
 	if (ret) {
 		SOCK_LOG_ERROR("failed to create conn listener thread\n");
 		goto err3;
@@ -1278,15 +1322,23 @@ void sock_ep_cm_wait_handle_finalized(struct sock_ep_cm_head *cm_head,
                                       struct sock_conn_req_handle *handle)
 {
 	handle->state = SOCK_CONN_HANDLE_FINALIZING;
-	pthread_mutex_lock(&cm_head->signal_lock);
+	ofi_mutex_lock(&cm_head->signal_lock);
 	sock_ep_cm_add_to_msg_list(cm_head, handle);
-	pthread_mutex_unlock(&cm_head->signal_lock);
+	ofi_mutex_unlock(&cm_head->signal_lock);
 
+#if HAVE_LITHE
+	lithe_mutex_lock(&handle->finalized_mutex);
+	while (handle->state != SOCK_CONN_HANDLE_FINALIZED)
+		ofi_wait_cond(&handle->finalized_cond,
+				&handle->finalized_mutex, -1);
+	lithe_mutex_unlock(&handle->finalized_mutex);
+#else
 	pthread_mutex_lock(&handle->finalized_mutex);
 	while (handle->state != SOCK_CONN_HANDLE_FINALIZED)
 		ofi_wait_cond(&handle->finalized_cond,
 				&handle->finalized_mutex, -1);
 	pthread_mutex_unlock(&handle->finalized_mutex);
+#endif
 }
 
 void sock_ep_cm_stop_thread(struct sock_ep_cm_head *cm_head)
@@ -1298,11 +1350,21 @@ void sock_ep_cm_stop_thread(struct sock_ep_cm_head *cm_head)
 
 	sock_ep_cm_signal(cm_head);
 
+#if HAVE_LITHE
+#if HAVE_LITHE
+	if (cm_head->listener_thread.context &&
+	    ofi_thread_join(&cm_head->listener_thread, NULL)) {
+#else
 	if (cm_head->listener_thread &&
 	    pthread_join(cm_head->listener_thread, NULL)) {
+#endif
+#else
+	if (cm_head->listener_thread &&
+	    pthread_join(cm_head->listener_thread, NULL)) {
+#endif
 		SOCK_LOG_DBG("pthread join failed\n");
 	}
 	ofi_epoll_close(cm_head->epollfd);
 	fd_signal_free(&cm_head->signal);
-	pthread_mutex_destroy(&cm_head->signal_lock);
+	ofi_mutex_destroy(&cm_head->signal_lock);
 }

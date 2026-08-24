@@ -358,7 +358,11 @@ _psmi_mutex_unlock_inner(pthread_mutex_t *mutex,
 #endif
 
 #define PSMI_YIELD(pl)							\
-	do { _PSMI_UNLOCK((pl)); sched_yield(); _PSMI_LOCK((pl)); } while (0)
+	do {								\
+		_PSMI_UNLOCK((pl));					\
+		yield();						\
+		_PSMI_LOCK((pl));					\
+	} while (0)
 
 #ifdef PSM2_MOCK_TESTING
 /* If this is a mocking tests build, all the operations on the locks

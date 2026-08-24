@@ -1124,6 +1124,38 @@ AC_DEFINE_UNQUOTED([HAVE_HSA_AMD_PORTABLE_EXPORT_DMABUF],[$have_hsa_amd_portable
 
 AC_CHECK_SIZEOF([void *])
 
+dnl Check for Lithe threading library
+AC_ARG_WITH([lithe],
+	    [AS_HELP_STRING([--with-lithe@<:@=DIR@:>@],
+			    [Enable Lithe threading library support @<:@default=no@:>@.
+			     Optional=<Path to where Lithe is installed.>])])
+
+have_lithe=0
+AS_IF([test x"$with_lithe" != x"no"],
+      [FI_CHECK_PACKAGE([lithe],
+			[lithe/lithe.h],
+			[lithe],
+			[lithe_sched_current],
+			[-llithe],
+			[$with_lithe],
+			[],
+			[have_lithe=1])
+       # Don't add parlib to global CPPFLAGS to avoid conflicts
+       # It will be included only in osd.c via a relative path
+      ])
+
+AS_IF([test x"$with_lithe" != x"no" && test -n "$with_lithe" && test "$have_lithe" = "0" ],
+	[AC_MSG_ERROR([Lithe support requested but Lithe runtime not available.])])
+
+AC_DEFINE_UNQUOTED([HAVE_LITHE], [$have_lithe], [Lithe threading library support])
+
+AS_IF([test "$have_lithe" = "1" && test x"$with_lithe" != x"yes"],
+      [CPPFLAGS="$CPPFLAGS $lithe_CPPFLAGS"
+       LDFLAGS="$LDFLAGS $lithe_LDFLAGS"])
+LIBS="$LIBS $lithe_LIBS"
+
+AM_CONDITIONAL([HAVE_LITHE], test "$have_lithe" -eq 1)
+
 dnl patching ${archive_cmds} to affect generation of file "libtool" to fix linking with clang
 dnl allows for building with clang lto and fast linking with non gnu ld
 dnl --> checking if the linker (clang) is GNU ld... no

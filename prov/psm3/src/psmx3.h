@@ -49,7 +49,11 @@ extern "C" {
 #include <unistd.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#if HAVE_LITHE
+#include <unix/osd.h>
+#else
 #include <pthread.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -571,7 +575,11 @@ struct psmx3_fid_domain {
 	struct dlist_entry	sep_list;
 
 	int			progress_thread_enabled;
+#if HAVE_LITHE
+	ofi_thread_t		progress_thread;
+#else
 	pthread_t		progress_thread;
+#endif
 
 	int			addr_format;
 	uint32_t		max_atomic_size;

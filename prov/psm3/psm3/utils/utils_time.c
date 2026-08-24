@@ -66,6 +66,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <pthread.h>
 
 #include "utils_user.h"
 
@@ -79,9 +80,10 @@
 #endif
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
-/* init the cycle counter to picosecs/cycle conversion automatically */
-/* at program startup, if it's using timing functions. */
-static void init_picos_per_cycle(void) __attribute__ ((constructor));
+/* Pico/cycle calibration: was a library constructor, but that interleaves with
+ * Lithe/parlib constructors (backing pthread snapshots main-thread TLS). TSan
+ * then reports a false race on sched_getaffinity vs parlib_tls_memcpy. Run once
+ * on first use via pthread_once instead. */
 static int hfi_timebase_isvalid(uint32_t pico_per_cycle);
 static uint32_t hfi_timebase_from_cpuinfo(uint32_t old_pico_per_cycle);
 
@@ -134,7 +136,7 @@ static int hfi_timebase_isvalid(uint32_t pico_per_cycle)
  * Derive the pico-per-cycle by trying to correlate the difference between two
  * reads of the tsc counter to gettimeofday.
  */
-static void init_picos_per_cycle()
+static void psm3_init_picos_per_cycle_once(void)
 {
 	struct timeval tvs, tve;
 	int64_t usec = 0;
@@ -143,26 +145,36 @@ static void init_picos_per_cycle()
 	uint32_t picos = 0;
 	int trials = 0;
 	int retry = 0;
-	cpu_set_t cpuset, cpuset_saved;
+	/* Heap masks: TSan reports a race if these live on the main stack while
+	 * Lithe/parlib’s backing pthread snapshots TLS during DSO init (same
+	 * shadow-address band as affinity writes). */
+	cpu_set_t *masks = (cpu_set_t *) malloc(2 * sizeof(cpu_set_t));
+	cpu_set_t *cpuset_saved = masks;
+	cpu_set_t *cpuset = masks ? masks + 1 : NULL;
 	int have_cpuset = 1;
 
-	/*
-	 * Make sure we try to calculate the cycle time without being migrated.
-	 */
-	CPU_ZERO(&cpuset_saved);
-	if (sched_getaffinity(0, sizeof(cpuset), &cpuset_saved))
+	if (!masks) {
 		have_cpuset = 0;
-	CPU_ZERO(&cpuset);
-	CPU_SET(0, &cpuset);
-	if (have_cpuset && sched_setaffinity(0, sizeof(cpuset), &cpuset))
-		have_cpuset = 0;
+	} else {
+		/*
+		 * Make sure we try to calculate the cycle time without being migrated.
+		 */
+		CPU_ZERO(cpuset_saved);
+		if (sched_getaffinity(0, sizeof(cpu_set_t), cpuset_saved))
+			have_cpuset = 0;
+		CPU_ZERO(cpuset);
+		CPU_SET(0, cpuset);
+		if (have_cpuset &&
+		    sched_setaffinity(0, sizeof(cpu_set_t), cpuset))
+			have_cpuset = 0;
+	}
 
 	/*
 	 * If we set affinity correctly, give the scheduler another change to put
 	 * us on processor 0
 	 */
 	if (have_cpuset)
-		sched_yield();
+		yield();
 
 retry_pico_test:
 	if (++retry == 10) {
@@ -191,11 +203,16 @@ retry_pico_test:
 	picos = (uint32_t) (usec / delta);
 
 	if (!hfi_timebase_isvalid(picos)) {
-		cpu_set_t cpuget;
-		int affinity_valid =
-		    !sched_getaffinity(0, sizeof(cpuget), &cpuget);
-		if (affinity_valid && !CPU_ISSET(0, &cpuget))
-			affinity_valid = 0;
+		cpu_set_t *cpuget = (cpu_set_t *) malloc(sizeof(cpu_set_t));
+		int affinity_valid = 0;
+
+		if (cpuget) {
+			affinity_valid =
+			    !sched_getaffinity(0, sizeof(*cpuget), cpuget);
+			if (affinity_valid && !CPU_ISSET(0, cpuget))
+				affinity_valid = 0;
+			free(cpuget);
+		}
 		timebase_warn
 		    ("Failed to get valid RTC timebase, gettimeofday delta=%lld, "
 		     "rtc delta=%lld, picos_per_cycle=%d affinity_valid=%s (trial %d/10)\n",
@@ -214,14 +231,15 @@ retry_pico_test:
 
 reset_cpu_mask:
 	/* Restore affinity */
-	if (have_cpuset) {
-		sched_setaffinity(0, sizeof(cpuset), &cpuset_saved);
+	if (have_cpuset && cpuset_saved && cpuset) {
+		sched_setaffinity(0, sizeof(cpu_set_t), cpuset_saved);
 		/*
 		 * Give a chance to other processes that also set affinity to 0 for
 		 * doing this test.
 		 */
-		sched_yield();
+		yield();
 	}
+	free(masks);
 }
 
 /*
@@ -240,7 +258,7 @@ static uint32_t hfi_timebase_from_cpuinfo(uint32_t old_pico_per_cycle)
 	gethostname(hostname, 80);
 	hostname[sizeof(hostname) - 1] = '\0';
 
-	// since called in a constructor, prior to psm3_init, must use getenv
+	// May run before psm3_init, must use getenv
 	// and /etc/psm3.conf can't control this setting
 	// when this is set, additional timebase initialization warnings are enabled
 	if (getenv("PSM3_DEBUG_TIMEBASE"))
@@ -299,4 +317,11 @@ fail:
 	     "pico/cycle, adjusted to safe default %d picos/cycle",
 	     old_pico_per_cycle, new_pico_per_cycle);
 	return new_pico_per_cycle;
+}
+
+static pthread_once_t psm3_timebase_once = PTHREAD_ONCE_INIT;
+
+void psm3_timebase_ensure_init(void)
+{
+	pthread_once(&psm3_timebase_once, psm3_init_picos_per_cycle_once);
 }

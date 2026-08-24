@@ -58,6 +58,14 @@
 #include <dlfcn.h>
 #endif
 
+/* Match util_mem_monitor.c / osd.c: only spam stderr when OFI_DEBUG is set. */
+static void ofi_fi_ini_trace(const char *msg)
+{
+	if (!getenv("OFI_DEBUG"))
+		return;
+	fputs(msg, stderr);
+	fflush(stderr);
+}
 
 struct ofi_prov {
 	struct ofi_prov		*next;
@@ -924,27 +932,49 @@ void fi_ini(void)
 {
 	char *param_val = NULL;
 
-	pthread_mutex_lock(&common_locks.ini_lock);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Starting initialization\n");
 
-	if (ofi_init)
+	ofi_mutex_lock_(&common_locks.ini_lock);
+
+	if (ofi_init) {
+		ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Already initialized, returning\n");
 		goto unlock;
+	}
 
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Not initialized, proceeding with init\n");
+
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_ordered_provs_init()\n");
 	ofi_ordered_provs_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling fi_param_init()\n");
 	fi_param_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling fi_log_init()\n");
 	fi_log_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_dump_sysconfig()\n");
 	ofi_dump_sysconfig();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_osd_init()\n");
 	ofi_osd_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_mem_init()\n");
 	ofi_mem_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_pmem_init()\n");
 	ofi_pmem_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_perf_init()\n");
 	ofi_perf_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_hook_init()\n");
 	ofi_hook_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_hmem_init()\n");
 	ofi_hmem_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_monitors_init()\n");
 	ofi_monitors_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_shm_p2p_init()\n");
 	ofi_shm_p2p_init();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Returned from ofi_shm_p2p_init()\n");
 
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Defining provider parameter\n");
 	fi_param_define(NULL, "provider", FI_PARAM_STRING,
-			"Only use specified provider (default: all available)");
+		"Only use specified provider (default: all available)");
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Getting provider parameter\n");
 	fi_param_get_str(NULL, "provider", &param_val);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Creating provider filter\n");
 	ofi_create_filter(&prov_filter, param_val);
 
 	fi_param_define(NULL, "fork_unsafe", FI_PARAM_BOOL,
@@ -973,26 +1003,46 @@ void fi_ini(void)
 			"The name of a colective offload provider (default: \
 			empty - no provider)");
 
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_params_init()\n");
 	ofi_params_init();
 
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Calling ofi_load_dl_prov()\n");
 	ofi_load_dl_prov();
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Finished ofi_load_dl_prov()\n");
 
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering providers\n");
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering PSM3\n");
 	ofi_register_provider(PSM3_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering PSM2\n");
 	ofi_register_provider(PSM2_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering CXI\n");
 	ofi_register_provider(CXI_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering USNIC\n");
 	ofi_register_provider(USNIC_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering SHM\n");
 	ofi_register_provider(SHM_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering SM2\n");
 	ofi_register_provider(SM2_INIT, NULL);
 
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering RXM\n");
 	ofi_register_provider(RXM_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering VERBS\n");
 	ofi_register_provider(VERBS_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering MRAIL\n");
 	ofi_register_provider(MRAIL_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering RXD\n");
 	ofi_register_provider(RXD_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering EFA\n");
 	ofi_register_provider(EFA_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering OPX\n");
 	ofi_register_provider(OPX_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering UCX\n");
 	ofi_register_provider(UCX_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering UDP\n");
 	ofi_register_provider(UDP_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering SOCKETS\n");
 	ofi_register_provider(SOCKETS_INIT, NULL);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Registering TCP\n");
 	ofi_register_provider(TCP_INIT, NULL);
 
 	ofi_register_provider(LNX_INIT, NULL);
@@ -1007,23 +1057,48 @@ void fi_ini(void)
 
 	ofi_register_provider(COLL_INIT, NULL);
 
+#if !HAVE_LITHE
 	pthread_atfork(NULL, NULL, ofi_memhooks_atfork_handler);
+#endif
+	/* Lithe doesn't support fork() - skip atfork handler */
 
 	ofi_init = 1;
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Initialization complete\n");
 
 unlock:
-	pthread_mutex_unlock(&common_locks.ini_lock);
+	ofi_mutex_unlock_(&common_locks.ini_lock);
+	ofi_fi_ini_trace("[OFI_DEBUG] fi_ini: Returning\n");
 }
 
 FI_DESTRUCTOR(fi_fini(void))
 {
+#if HAVE_LITHE
+	/* Check if we're still in a scheduler - if so, cleanup can use mutexes */
+	/* The scheduler should be cleaned up in the finalizer, so we should still be in it */
+	lithe_sched_t *current_sched = lithe_sched_current();
+	int in_scheduler = (current_sched != NULL && current_sched->parent != NULL);
+	
+	/* If not in scheduler, check if we have a cached reference */
+	if (!in_scheduler) {
+		extern lithe_fork_join_sched_t *ofi_scheduler;
+		if (ofi_scheduler != NULL) {
+			lithe_sched_t *sched = (lithe_sched_t*)ofi_scheduler;
+			if (sched != NULL && sched->parent != NULL) {
+				/* We have a cached scheduler - we can still use mutexes */
+				in_scheduler = 1;
+			}
+		}
+	}
+	
+	if (!in_scheduler) {
+		/* We're in base scheduler - scheduler was destroyed before finalizer */
+		/* Set cleanup flag to skip mutex operations */
+		extern volatile int ofi_cleanup_in_progress;
+		__atomic_store_n(&ofi_cleanup_in_progress, 1, __ATOMIC_RELEASE);
+	}
+	/* If we're in a scheduler, don't set cleanup flag - mutexes can be used */
+#endif
 	struct ofi_prov *prov;
-
-	pthread_mutex_lock(&common_locks.ini_lock);
-
-	if (!ofi_init)
-		goto unlock;
-
 	while (prov_head) {
 		prov = prov_head;
 		prov_head = prov->next;
@@ -1031,6 +1106,16 @@ FI_DESTRUCTOR(fi_fini(void))
 	}
 
 	ofi_free_filter(&prov_filter);
+#if HAVE_LITHE
+	/* Re-check scheduler state before cleanup */
+	current_sched = lithe_sched_current();
+	in_scheduler = (current_sched != NULL && current_sched->parent != NULL);
+	if (!in_scheduler) {
+		/* Still in base scheduler - ensure cleanup flag is set */
+		extern volatile int ofi_cleanup_in_progress;
+		__atomic_store_n(&ofi_cleanup_in_progress, 1, __ATOMIC_RELEASE);
+	}
+#endif
 	ofi_shm_p2p_cleanup();
 	ofi_monitors_cleanup();
 	ofi_hmem_cleanup();
@@ -1040,10 +1125,15 @@ FI_DESTRUCTOR(fi_fini(void))
 	fi_param_fini();
 	ofi_osd_fini();
 
-	ofi_init = 0;
+#if HAVE_LITHE
+	/* Clear scheduler reference - we don't own it, so we don't destroy it */
+	/* The scheduler is managed by OpenMPI/parlib, not by us */
+	/* But we can clear our reference to it */
+	extern lithe_fork_join_sched_t *ofi_scheduler;
+	ofi_scheduler = NULL;
+#endif
 
-unlock:
-	pthread_mutex_unlock(&common_locks.ini_lock);
+	ofi_init = 0;
 }
 
 __attribute__((visibility ("default"),EXTERNALLY_VISIBLE))

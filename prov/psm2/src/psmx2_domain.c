@@ -138,10 +138,17 @@ static void psmx2_domain_start_progress(struct psmx2_fid_domain *domain)
 {
 	int err;
 
+#if HAVE_LITHE
+	err = ofi_thread_create(&domain->progress_thread, psmx2_progress_func, (void *)domain);
+	if (err) {
+		/* For Lithe, we can't use pthread_self() - just mark as failed */
+		domain->progress_thread.context = NULL;
+#else
 	err = pthread_create(&domain->progress_thread, NULL,
 			     psmx2_progress_func, (void *)domain);
 	if (err) {
 		domain->progress_thread = pthread_self();
+#endif
 		FI_INFO(&psmx2_prov, FI_LOG_CORE,
 			"pthread_create returns %d\n", err);
 	} else {
@@ -154,6 +161,15 @@ static void psmx2_domain_stop_progress(struct psmx2_fid_domain *domain)
 	int err;
 	void *exit_code;
 
+#if HAVE_LITHE
+	/* For Lithe, we can't use pthread_equal or pthread_cancel */
+	/* Just join the thread if it exists */
+	err = 0;
+	if (domain->progress_thread.context) {
+		err = ofi_thread_join(&domain->progress_thread, &exit_code);
+	}
+#else
+	err = 0;
 	if (!pthread_equal(domain->progress_thread, pthread_self())) {
 		err = pthread_cancel(domain->progress_thread);
 		if (err) {
@@ -161,16 +177,17 @@ static void psmx2_domain_stop_progress(struct psmx2_fid_domain *domain)
 				"pthread_cancel returns %d\n", err);
 		}
 		err = pthread_join(domain->progress_thread, &exit_code);
-		if (err) {
-			FI_INFO(&psmx2_prov, FI_LOG_CORE,
-				"pthread_join returns %d\n", err);
-		} else {
-			FI_INFO(&psmx2_prov, FI_LOG_CORE,
-				"progress thread exited with code %ld (%s)\n",
-				(uintptr_t)exit_code,
-				(exit_code == PTHREAD_CANCELED) ?
-					"PTHREAD_CANCELED" : "?");
-		}
+	}
+#endif
+	if (err) {
+		FI_INFO(&psmx2_prov, FI_LOG_CORE,
+			"pthread_join returns %d\n", err);
+	} else {
+		FI_INFO(&psmx2_prov, FI_LOG_CORE,
+			"progress thread exited with code %ld (%s)\n",
+			(uintptr_t)exit_code,
+			(exit_code == PTHREAD_CANCELED) ?
+				"PTHREAD_CANCELED" : "?");
 	}
 }
 

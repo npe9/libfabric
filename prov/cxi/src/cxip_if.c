@@ -254,7 +254,11 @@ int cxip_alloc_lni(struct cxip_if *iface, uint32_t svc_id,
 	}
 
 	lni->iface = iface;
+#if HAVE_LITHE
+	ofi_mutex_init(&lni->cp_lock);
+#else
 	pthread_rwlock_init(&lni->cp_lock, NULL);
+#endif
 	dlist_init(&lni->remap_cps);
 
 	CXIP_DBG("Allocated LNI, %s RGID: %u\n",
@@ -364,7 +368,7 @@ static int netdev_link(char *netdev, int *link)
 	int rc;
 	char path[CXIP_PATH_MAX];
 	FILE *f;
-	char state[20];
+	char state[21]; /* %20s writes 20 chars + NUL */
 	int carrier;
 
 	rc = snprintf(path, CXIP_PATH_MAX, "/sys/class/net/%s/operstate",

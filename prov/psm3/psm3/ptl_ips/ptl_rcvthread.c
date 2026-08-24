@@ -53,7 +53,16 @@
 
 /* Copyright (c) 2003-2014 Intel Corporation. All rights reserved. */
 
+#include "config.h"
+
+#if HAVE_LITHE
+/* Before PSM headers: parlib/lithe vs PSM utils_macros atomic_* clash if reversed. */
+#include <unix/osd.h>
+#include "ofi_lock.h"
+#endif
+
 #include <sys/poll.h>
+#include <pthread.h>
 
 #include "psm_user.h"
 #include "psm2_hal.h"
@@ -72,7 +81,14 @@ struct ptl_rcvthread {
 	const ptl_t *ptl;
 	struct ips_recvhdrq *recvq;
 
+#if HAVE_LITHE
+	ofi_thread_t hdrq_thread;
+	lithe_mutex_t join_mutex;
+	lithe_condvar_t join_cond;
+	int hdrq_finished;
+#else
 	pthread_t hdrq_threadid;
+#endif
 	uint64_t t_start_cyc;
 	int pipefd[2];
 
@@ -92,14 +108,22 @@ struct ptl_rcvthread {
 	uint32_t last_timeout;
 };
 
-#ifdef PSM_DSA
-// we only create one per process, can save here for read/compare only
-pthread_t psm3_rcv_threadid;
+#if defined(PSM_DSA) && !HAVE_LITHE
+/* pthread identity for DSA WQ selection (see psm3_ips_ptl_rcvthread_is_self). */
+static pthread_t psm3_rcv_pthread_id;
+#endif
+#if defined(PSM_DSA) && HAVE_LITHE
+static lithe_context_t *psm3_ips_rcvthread_self;
 #endif
 
 // for psm3_wait and psm3_wake
+#if HAVE_LITHE
+static lithe_mutex_t     wait_mutex;
+static lithe_condvar_t   wait_condvar;
+#else
 static pthread_mutex_t     wait_mutex;
 static pthread_cond_t      wait_condvar;
+#endif
 static int wait_signalled;
 
 // statistics for psm3_wait and psm3_wake
@@ -141,16 +165,39 @@ psm2_error_t psm3_ips_ptl_rcvthread_init(ptl_t *ptl_gen, struct ips_recvhdrq *re
 	if (psmi_hal_has_sw_status(PSM_HAL_PSMI_RUNTIME_RTS_RX_THREAD) &&
 	    (!psmi_hal_has_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED))){
 
-		pthread_condattr_t attr;
-		pthread_condattr_init(&attr);
-		pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-		pthread_cond_init(&wait_condvar, &attr);
+#if HAVE_LITHE
+		{
+			lithe_mutexattr_t wattr;
 
-		pthread_mutex_init(&wait_mutex, NULL);
+			lithe_mutexattr_init(&wattr);
+			lithe_mutex_init(&wait_mutex, &wattr);
+			lithe_condvar_init(&wait_condvar);
+		}
+#else
+		{
+			pthread_condattr_t attr;
+
+			pthread_condattr_init(&attr);
+			pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+			pthread_cond_init(&wait_condvar, &attr);
+			pthread_mutex_init(&wait_mutex, NULL);
+		}
+#endif
 		wait_signalled = 0;
 
 		if ((err = rcvthread_initsched(rcvc)))
 			goto fail;
+
+#if HAVE_LITHE
+		{
+			lithe_mutexattr_t jattr;
+
+			rcvc->hdrq_finished = 0;
+			lithe_mutexattr_init(&jattr);
+			lithe_mutex_init(&rcvc->join_mutex, &jattr);
+			lithe_condvar_init(&rcvc->join_cond);
+		}
+#endif
 
 		/* Create a pipe so we can synchronously terminate the thread */
 		if (pipe(rcvc->pipefd) != 0) {
@@ -161,6 +208,18 @@ psm2_error_t psm3_ips_ptl_rcvthread_init(ptl_t *ptl_gen, struct ips_recvhdrq *re
 		}
 
 		psmi_hal_add_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED);
+#if HAVE_LITHE
+		rcvc->hdrq_thread.context = NULL;
+		if (ofi_thread_create(&rcvc->hdrq_thread, ips_ptl_pollintr,
+				       ptl->rcvthread)) {
+			close(rcvc->pipefd[0]);
+			close(rcvc->pipefd[1]);
+			err = psm3_handle_error(ptl->ep, PSM2_EP_DEVICE_FAILURE,
+						"Cannot start receive thread: %s\n",
+						strerror(errno));
+			goto fail;
+		}
+#else
 		if (pthread_create(&rcvc->hdrq_threadid, NULL,
 				   ips_ptl_pollintr, ptl->rcvthread)) {
 			close(rcvc->pipefd[0]);
@@ -170,8 +229,9 @@ psm2_error_t psm3_ips_ptl_rcvthread_init(ptl_t *ptl_gen, struct ips_recvhdrq *re
 						strerror(errno));
 			goto fail;
 		}
-#ifdef PSM_DSA
-		psm3_rcv_threadid = rcvc->hdrq_threadid;
+#endif
+#if defined(PSM_DSA) && !HAVE_LITHE
+		psm3_rcv_pthread_id = rcvc->hdrq_threadid;
 #endif
 		if ((err = rcvthread_initstats(ptl_gen)))
 			goto fail;
@@ -196,7 +256,13 @@ psm2_error_t psm3_ips_ptl_rcvthread_fini(ptl_t *ptl_gen)
 		return err;
 
 	psm3_stats_deregister_type(PSMI_STATSTYPE_RCVTHREAD, rcvc);
-	if (rcvc->hdrq_threadid && psmi_hal_has_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED)) {
+#if HAVE_LITHE
+	if (rcvc->hdrq_thread.context &&
+	    psmi_hal_has_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED)) {
+#else
+	if (rcvc->hdrq_threadid &&
+	    psmi_hal_has_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED)) {
+#endif
 		t_now = get_cycles();
 
 		/* Disable interrupts then kill the receive thread */
@@ -216,16 +282,30 @@ psm2_error_t psm3_ips_ptl_rcvthread_fini(ptl_t *ptl_gen)
 			_HFI_VDBG
 			    ("unable to close pipe to receive thread cleanly\n");
 		}
+#if HAVE_LITHE
+		/* ofi_thread_join is not safe here: fork-join destroys the
+		 * context on exit. Wait until ips_ptl_pollintr signals. */
+		lithe_mutex_lock(&rcvc->join_mutex);
+		while (!rcvc->hdrq_finished)
+			lithe_condvar_wait(&rcvc->join_cond, &rcvc->join_mutex);
+		lithe_mutex_unlock(&rcvc->join_mutex);
+		memset(&rcvc->hdrq_thread, 0, sizeof(rcvc->hdrq_thread));
+#else
 		pthread_join(rcvc->hdrq_threadid, NULL);
-		psmi_hal_sub_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED);
 		rcvc->hdrq_threadid = 0;
+#endif
+		psmi_hal_sub_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED);
 		_HFI_PRDBG("rcvthread poll success %lld/%lld times, "
 				 "thread cancelled in %.3f us\n",
 				(long long)rcvc->pollok, (long long)rcvc->pollcnt,
 				(double)cycles_to_nanosecs(get_cycles() - t_now) / 1e3);
 
+#if HAVE_LITHE
+		/* Lithe mutex/cond: no destroy in this tree */
+#else
 		pthread_cond_destroy(&wait_condvar);
 		pthread_mutex_destroy(&wait_mutex);
+#endif
 		wait_signalled = 0;
 	}
 
@@ -447,6 +527,33 @@ psm2_error_t psm3_wait(int timeout_ms)
 	// at least 1 bit in event flag per thread so all can be truely woken
 	// or maybe treat like a counting event and each gets a count?
 	// but some might not be waiting?
+#if HAVE_LITHE
+	lithe_mutex_lock(&wait_mutex);
+	if (wait_signalled) {
+		// autoclear
+		wait_signalled = 0;
+		wait_nosleep_signalled_count++;
+		_HFI_VDBG("found already signaled, no sleep\n");
+	} else if (timeout_ms < 0) {	// infinite timeout
+		lithe_condvar_wait(&wait_condvar, &wait_mutex);
+		wait_signalled = 0;
+		wait_sleep_til_signal_count++;
+		_HFI_VDBG("slept, infinite timeout\n");
+	} else {
+		int wc = ofi_wait_cond(&wait_condvar, &wait_mutex, timeout_ms);
+
+		if (wc != 0) {
+			_HFI_VDBG("slept, timeout\n");
+			ret = PSM2_TIMEOUT;
+			wait_sleep_timeout_count++;
+		} else {
+			_HFI_VDBG("slept, signalled before timeout. signaled=%d\n", wait_signalled);
+			wait_signalled = 0;
+			wait_sleep_signal_count++;
+		}
+	}
+	lithe_mutex_unlock(&wait_mutex);
+#else
 	pthread_mutex_lock(&wait_mutex);
 	if (wait_signalled) {
 		// autoclear
@@ -480,6 +587,7 @@ psm2_error_t psm3_wait(int timeout_ms)
 		}
 	}
 	pthread_mutex_unlock(&wait_mutex);
+#endif
 	// TBD if ret == PSM2_OK we could use ipeek to see if any real progress
 	// was made and loop back to start to wait again if not.  For now we
 	// leave that to our caller
@@ -503,12 +611,19 @@ void psm3_wake(psm2_ep_t ep)
 	_HFI_VDBG("wakeup\n");
 	PSMI_LOCK_ASSERT(psm3_creation_lock);
 	psmi_hal_sub_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_WAITING);
-	pthread_mutex_lock( &wait_mutex );
+#if HAVE_LITHE
+	lithe_mutex_lock(&wait_mutex);
 	wakeup_count++;
 	wait_signalled = 1;
-	pthread_cond_signal(&wait_condvar );
-	//pthread_cond_broadcast(&wait_condvar );
-	pthread_mutex_unlock( &wait_mutex );
+	lithe_condvar_signal(&wait_condvar);
+	lithe_mutex_unlock(&wait_mutex);
+#else
+	pthread_mutex_lock(&wait_mutex);
+	wakeup_count++;
+	wait_signalled = 1;
+	pthread_cond_signal(&wait_condvar);
+	pthread_mutex_unlock(&wait_mutex);
+#endif
 }
 
 static
@@ -536,7 +651,21 @@ int rcvthread_next_timeout(struct ptl_rcvthread *rcvc)
 	return (int)rcvc->last_timeout;
 }
 
-extern int ips_in_rcvthread;
+#if HAVE_LITHE
+/* Signal psm3_ips_ptl_rcvthread_fini after ips_ptl_pollintr returns; fork-join
+ * destroys the Lithe context on exit so we cannot pthread_join/ofi_thread_join.
+ */
+static void rcvthread_hdrq_join_complete(struct ptl_rcvthread *rcvc)
+{
+#if defined(PSM_DSA)
+	psm3_ips_rcvthread_self = NULL;
+#endif
+	lithe_mutex_lock(&rcvc->join_mutex);
+	rcvc->hdrq_finished = 1;
+	lithe_condvar_broadcast(&rcvc->join_cond);
+	lithe_mutex_unlock(&rcvc->join_mutex);
+}
+#endif
 
 /*
  * Receiver thread support.
@@ -564,11 +693,18 @@ void *ips_ptl_pollintr(void *rcvthreadc)
 	 * recvhdrq init function is misused */
 	psmi_assert_always(psmi_hal_has_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED));
 
+#if defined(PSM_DSA) && HAVE_LITHE
+	psm3_ips_rcvthread_self = lithe_context_self();
+#endif
+
 	/* Switch driver to a mode where it can interrupt on urgent packets */
 	if (psm3_context_interrupt_set(rcvc->ep, 1) == PSM2_EP_NO_RESOURCES) {
 		_HFI_PRDBG
 		    ("poll_type feature not present in driver, turning "
 		     "off internal progress thread\n");
+#if HAVE_LITHE
+		rcvthread_hdrq_join_complete(rcvc);
+#endif
 		return NULL;
 	}
 
@@ -597,9 +733,25 @@ void *ips_ptl_pollintr(void *rcvthreadc)
 		}
 	}
 
+#if HAVE_LITHE
+	rcvthread_hdrq_join_complete(rcvc);
+#endif
 	PSM2_LOG_MSG("leaving");
 	return NULL;
 }
+
+#ifdef PSM_DSA
+int psm3_ips_ptl_rcvthread_is_self(void)
+{
+#if HAVE_LITHE
+	return psm3_ips_rcvthread_self != NULL &&
+	       lithe_context_self() == psm3_ips_rcvthread_self;
+#else
+	return psm3_rcv_pthread_id != 0 &&
+	       pthread_equal(psm3_rcv_pthread_id, pthread_self());
+#endif
+}
+#endif
 
 static uint64_t rcvthread_stats_pollok(void *context)
 {

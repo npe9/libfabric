@@ -41,10 +41,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
+#include <execinfo.h>
 #include <pthread.h>
 #ifdef __FreeBSD__
 #include <pthread_np.h>
 #endif
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -57,6 +60,48 @@
 
 #include "rdma/fi_errno.h"
 #include "rdma/providers/fi_log.h"
+
+#if HAVE_LITHE
+/* Include Lithe headers at file scope */
+/* Save and undefine conflicting macros/types before including parlib */
+/* libfabric may have defined these as macros, parlib defines them as functions */
+#ifdef LOG2_DOWN
+#define _OFI_SAVED_LOG2_DOWN
+#undef LOG2_DOWN
+#endif
+#ifdef LOG2_UP
+#define _OFI_SAVED_LOG2_UP
+#undef LOG2_UP
+#endif
+#ifdef ROUNDUPPWR2
+#define _OFI_SAVED_ROUNDUPPWR2
+#undef ROUNDUPPWR2
+#endif
+
+/* Include parlib and lithe headers with atomic symbol renaming */
+/* First undefine stdatomic.h's atomic_init if it exists */
+#ifdef atomic_init
+#undef atomic_init
+#endif
+/* Rename parlib's atomic_t and atomic_init to avoid conflicts */
+#define atomic_t __parlib_atomic_t_renamed
+#define atomic_init __parlib_atomic_init_renamed
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wnested-externs"
+/* Don't include parlib.h - it has constructors that interfere with parlib's initialization */
+/* Only include Lithe headers we actually need */
+#include <lithe/lithe.h>
+#include <lithe/mutex.h>
+#include <lithe/condvar.h>
+#include <lithe/fork_join_sched.h>
+#pragma GCC diagnostic pop
+
+/* Restore atomic names for libfabric */
+#undef atomic_t
+#undef atomic_init
+#endif /* HAVE_LITHE */
 
 #ifdef __FreeBSD__
 typedef cpuset_t ofi_cpu_set_t;
@@ -108,8 +153,340 @@ int fi_fd_block(int fd)
 	return 0;
 }
 
+/* Global flag to track cleanup state */
+volatile int ofi_cleanup_in_progress = 0;
+
+#if HAVE_LITHE
+/* Our own scheduler - created in constructor, destroyed in atexit handler */
+lithe_fork_join_sched_t *ofi_scheduler = NULL;
+static int ofi_scheduler_entered = 0;
+
+static int ofi_debug_enabled(void) {
+    return getenv("OFI_DEBUG") != NULL;
+}
+
+/* Create our own scheduler */
+static void ofi_create_scheduler(void) {
+    if (ofi_scheduler != NULL) {
+        return; /* Already created */
+    }
+    
+    /* Create a fork-join scheduler for libfabric */
+    ofi_scheduler = lithe_fork_join_sched_create();
+    if (ofi_scheduler == NULL) {
+        if (ofi_debug_enabled()) {
+            fprintf(stderr, "[OFI_DEBUG] Failed to create libfabric scheduler\n");
+            fflush(stderr);
+        }
+        return;
+    }
+    
+    if (ofi_debug_enabled()) {
+        fprintf(stderr, "[OFI_DEBUG] Created libfabric scheduler %p\n", (void*)ofi_scheduler);
+        fflush(stderr);
+    }
+}
+
+/* Enter our scheduler if we're in a scheduler context */
+static void ofi_enter_scheduler(void) {
+    if (ofi_scheduler == NULL) {
+        ofi_create_scheduler();
+    }
+    
+    if (ofi_scheduler_entered) {
+        return; /* Already entered */
+    }
+    
+    /* Check if we're in a scheduler context (not base scheduler) */
+    lithe_sched_t *current_sched = lithe_sched_current();
+    if (current_sched != NULL && current_sched->parent != NULL) {
+        /* We're in a scheduler - enter our scheduler as a child */
+        lithe_sched_enter((lithe_sched_t*)ofi_scheduler);
+        ofi_scheduler_entered = 1;
+        if (ofi_debug_enabled()) {
+            fprintf(stderr, "[OFI_DEBUG] Entered libfabric scheduler %p\n", (void*)ofi_scheduler);
+            fflush(stderr);
+        }
+    }
+}
+
+/* Get our scheduler - create and enter it if needed */
+static lithe_fork_join_sched_t *ofi_get_scheduler(void) {
+    if (ofi_scheduler == NULL) {
+        ofi_create_scheduler();
+    }
+    
+    /* Try to enter it if we're in a scheduler context */
+    ofi_enter_scheduler();
+    
+    return ofi_scheduler;
+}
+
+/* Cleanup handler - destroy our scheduler */
+static void ofi_cleanup_handler(void) {
+    ofi_cleanup_in_progress = 1;
+    if (ofi_scheduler != NULL) {
+        if (ofi_debug_enabled()) {
+            fprintf(stderr, "[OFI_DEBUG] ofi_cleanup_handler: Destroying libfabric scheduler %p\n", (void*)ofi_scheduler);
+            fflush(stderr);
+        }
+        lithe_fork_join_sched_destroy(ofi_scheduler);
+        ofi_scheduler = NULL;
+        ofi_scheduler_entered = 0;
+    }
+}
+
+/* Constructor(200): init Lithe locks before any fi_* call. OMPI5 does not call
+ * ofi_init_lithe_scheduler, so common_locks and mem_monitor locks must be
+ * initialized here. Priority 200 runs after Lithe/parlib (65535). */
+static void ofi_init_lithe_locks(void) {
+    extern void ofi_init_common_locks(void);
+    extern void ofi_init_mem_monitor_locks(void);
+    ofi_init_common_locks();
+    ofi_init_mem_monitor_locks();
+}
+__attribute__((constructor(200)))
+static void ofi_init_lithe_locks_ctor(void) {
+    ofi_init_lithe_locks();
+}
+
+/* Initialize libfabric's Lithe scheduler - may be called from OpenMPI for full init */
+void ofi_init_lithe_scheduler(void) {
+    /* Register cleanup handler */
+    atexit(ofi_cleanup_handler);
+    
+    /* Create our scheduler */
+    ofi_create_scheduler();
+    
+    /* Locks already initialized by constructor; ensure idempotent */
+    ofi_init_lithe_locks();
+    
+    /* Try to enter it if we're in a scheduler context (not base scheduler) */
+    lithe_sched_t *current_sched = lithe_sched_current();
+    if (current_sched != NULL && current_sched->parent != NULL) {
+        /* We're in a scheduler context - enter our scheduler */
+        lithe_sched_enter((lithe_sched_t*)ofi_scheduler);
+        ofi_scheduler_entered = 1;
+        if (ofi_debug_enabled()) {
+            fprintf(stderr, "[OFI_DEBUG] ofi_init_lithe_scheduler: Entered libfabric scheduler %p\n", (void*)ofi_scheduler);
+            fflush(stderr);
+        }
+    } else if (ofi_debug_enabled()) {
+        fprintf(stderr, "[OFI_DEBUG] ofi_init_lithe_scheduler: In base scheduler, will enter scheduler lazily\n");
+        fflush(stderr);
+    }
+}
+
+/* Ensure we're in the scheduler before using mutexes */
+/* This is called from other threads/contexts that might not be in the scheduler */
+void ofi_ensure_in_scheduler(void) {
+    /* Try to enter our scheduler if we're in a scheduler context */
+    ofi_enter_scheduler();
+}
+
+/* Wrapper for thread function signature conversion */
+struct ofi_thread_wrapper {
+    void *(*pthread_func)(void *);
+    void *arg;
+};
+
+static void ofi_thread_wrapper_func(void *arg) {
+    struct ofi_thread_wrapper *wrapper = (struct ofi_thread_wrapper *)arg;
+    wrapper->pthread_func(wrapper->arg);
+    free(wrapper);
+}
+
+/* Thread creation using Lithe contexts.
+ *
+ * IMPORTANT (composition / no-hijack): the background helper context (e.g. the
+ * kdreg2 MR-cache evictor, transport progress threads) is created in the
+ * CALLER'S CURRENT fork-join scheduler -- normally the process-wide root FJS
+ * that the main rank context already runs under. We deliberately do NOT enter
+ * a separate libfabric child scheduler here.
+ *
+ * The old code called ofi_enter_scheduler() -> lithe_sched_enter(ofi_scheduler)
+ * with no matching lithe_sched_exit(). lithe_sched_enter() HIJACKS the current
+ * context (swaps in child->main_context and stashes the caller as
+ * child->parent_context), so the rank's main context was permanently moved into
+ * libfabric's child scheduler. The rest of MPI_Init -- including the PMIx fence
+ * -- then ran as the CHILD sched's master context. That child master context,
+ * when it blocks on the parlib reactor (PMIx/libevent socket wait) and is later
+ * woken, is not re-dispatched by the parent because the cross-scheduler
+ * hart-grant of a child master context deadlocks: all vcores park idle in the
+ * root's reactor drive while the woken context waits for a hart that never
+ * arrives (observed as an MPI_Init hang at VCORE_LIMIT=1 and >=2 whenever the
+ * kdreg2 evictor is present; disabling the monitor -- and thus never entering
+ * the child sched -- ran clean). Creating the helper in the current (root) FJS
+ * keeps main in the root, and the helper is a normal worker context that the
+ * root already schedules correctly (it parks on the reactor and is woken via
+ * the standard uthread_runnable path). */
+int ofi_thread_create(ofi_thread_t *thread, void *(*start_routine)(void *), void *arg) {
+    /* Initialize thread context to NULL in case we fail early */
+    thread->context = NULL;
+
+    /* Create the helper context in the CURRENT fork-join scheduler. Must be a
+     * real (non-base) scheduler: the root FJS has parent == base_sched. We do
+     * NOT enter a child scheduler (see the no-hijack note above). */
+    lithe_sched_t *current_sched = lithe_sched_current();
+    if (current_sched == NULL || current_sched->parent == NULL) {
+        if (ofi_debug_enabled()) {
+            fprintf(stderr, "[OFI_DEBUG] ofi_thread_create: not in a schedulable context (current_sched=%p) -- cannot create helper\n",
+                    (void *)current_sched);
+            fflush(stderr);
+        }
+        /* thread->context is already NULL from initialization above */
+        return -1;
+    }
+
+    /* LITHE_PROGRESS_SCHED=child: evictor/progress helpers on dedicated child FJS. */
+    lithe_fork_join_sched_t *sched = lithe_fork_join_sched_progress_sched();
+    if (sched == NULL)
+        sched = (lithe_fork_join_sched_t *)current_sched;
+    
+    if (ofi_debug_enabled()) {
+        fprintf(stderr, "[OFI_DEBUG] ofi_thread_create: In scheduler %p, creating context\n", sched);
+        fflush(stderr);
+    }
+    
+    /* Create wrapper to convert pthread-style function to Lithe-style */
+    struct ofi_thread_wrapper *wrapper = malloc(sizeof(struct ofi_thread_wrapper));
+    if (wrapper == NULL) {
+        if (ofi_debug_enabled()) {
+            fprintf(stderr, "[OFI_DEBUG] ofi_thread_create: Failed to allocate wrapper\n");
+            fflush(stderr);
+        }
+        return -1;
+    }
+    wrapper->pthread_func = start_routine;
+    wrapper->arg = arg;
+    
+    /* Create a context in the progress or current fork-join scheduler. */
+    lithe_fork_join_context_t *ctx = lithe_fork_join_context_create(
+        sched,
+        FJS_STACK_SIZE,
+        ofi_thread_wrapper_func,
+        wrapper
+    );
+    
+    if (ctx == NULL) {
+        if (ofi_debug_enabled()) {
+            fprintf(stderr, "[OFI_DEBUG] ofi_thread_create: Failed to create context\n");
+            fflush(stderr);
+        }
+        free(wrapper);
+        thread->context = NULL; /* Ensure it's NULL on failure */
+        return -1;
+    }
+    
+    if (ofi_debug_enabled()) {
+        fprintf(stderr, "[OFI_DEBUG] ofi_thread_create: Created context %p, yielding to scheduler\n", ctx);
+        fflush(stderr);
+    }
+    thread->context = ctx;
+    
+    /* lithe_fork_join_context_create automatically enqueues the context to the scheduler */
+    /* The context is now in the scheduler's run queue and will be scheduled automatically */
+    /* We must yield to allow the scheduler to run the new context */
+    /* Keep yielding until we're confident the scheduler has had a chance to run it */
+    /* This is critical - without yielding, the new context may never run */
+    for (int i = 0; i < 10; i++) {
+        lithe_context_yield();
+    }
+    
+    if (ofi_debug_enabled()) {
+        fprintf(stderr, "[OFI_DEBUG] ofi_thread_create: Finished yielding, context should be running\n");
+        fflush(stderr);
+    }
+    return 0;
+}
+
+int ofi_thread_join(ofi_thread_t *thread, void **retval) {
+    if (thread->context == NULL) {
+        return -1;
+    }
+    
+    /* Get the current scheduler */
+    lithe_fork_join_sched_t *sched = ofi_get_scheduler();
+    if (sched == NULL) {
+        return -1; /* Not in a scheduler */
+    }
+    
+    /* Join the context - this will block until it completes */
+    lithe_fork_join_sched_join_one(sched);
+    
+    /* Clean up the context */
+    lithe_fork_join_context_cleanup(thread->context);
+    lithe_fork_join_context_destroy(thread->context);
+    thread->context = NULL;
+    
+    if (retval) {
+        *retval = NULL; /* Lithe doesn't return values, but set to NULL for compatibility */
+    }
+    
+    return 0;
+}
+
+void ofi_thread_exit(void *retval) {
+    /* In Lithe, contexts just return from their function */
+    /* The wrapper function will free itself and return */
+    (void)retval; /* Unused, but keep for compatibility */
+}
+#else
+/* Register atexit handler to set cleanup flag */
+static void ofi_cleanup_handler(void) {
+    ofi_cleanup_in_progress = 1;
+}
+
+__attribute__((constructor))
+static void ofi_init_cleanup_detection(void) {
+    atexit(ofi_cleanup_handler);
+}
+#endif
+
+#if HAVE_LITHE
+int ofi_wait_cond(lithe_condvar_t *cond, lithe_mutex_t *mut, int timeout_ms)
+#else
 int ofi_wait_cond(pthread_cond_t *cond, pthread_mutex_t *mut, int timeout_ms)
+#endif
 {
+#if HAVE_LITHE
+	/* No longer referencing parlib symbols - we don't include parlib.h */
+	
+	/* Don't use Lithe during cleanup - base scheduler contexts cannot block */
+	/* The cleanup flag is set by atexit handler before cleanup runs */
+	/* Check this FIRST, before any Lithe operations */
+	if (ofi_cleanup_in_progress) {
+		/* During cleanup, we can't block - return immediately */
+		/* This prevents the "Contexts created by the base scheduler should never need to block!" error */
+		return 0; /* Return success to avoid breaking cleanup */
+	}
+	
+	lithe_sched_t *sched = lithe_sched_current();
+	lithe_context_t *current_ctx = lithe_context_self();
+	
+	if (sched != NULL) {
+		if (current_ctx != NULL) {
+			/* Use Lithe's own concurrency primitives directly */
+			/* Wait on Lithe condition variable with Lithe mutex */
+			/* The mutex should already be locked by the caller using lithe_mutex_lock */
+			if (timeout_ms < 0) {
+				/* Wait indefinitely using Lithe's condvar */
+				return lithe_condvar_wait(cond, mut);
+			} else {
+				/* Lithe condvar doesn't support timeout, so wait without timeout */
+				/* TODO: Implement timeout using lithe_context_block with timer */
+				return lithe_condvar_wait(cond, mut);
+			}
+		}
+	}
+	/* If not in Lithe context and not in cleanup, this shouldn't happen */
+	/* But if we're in cleanup, return success to avoid blocking */
+	if (ofi_cleanup_in_progress) {
+		return 0;
+	}
+	return -1;
+#else
+	/* Fall back to regular pthread condition variables */
 	uint64_t t;
 	struct timespec ts;
 
@@ -120,6 +497,7 @@ int ofi_wait_cond(pthread_cond_t *cond, pthread_mutex_t *mut, int timeout_ms)
 	ts.tv_sec = t / 1000;
 	ts.tv_nsec = (t % 1000) * 1000000;
 	return pthread_cond_timedwait(cond, mut, &ts);
+#endif
 }
 
 int ofi_mmap_anon_pages(void **memptr, size_t size, int flags)
@@ -238,114 +616,82 @@ int ofi_shm_unmap(struct util_shm* shm)
 	return FI_SUCCESS;
 }
 
-int fi_read_file(const char *dir, const char *file, char *buf, size_t size)
-{
-	char *path;
-	int fd, len;
-
-	if (asprintf(&path, "%s/%s", dir, file) < 0)
-		return -1;
-
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		free(path);
-		return -1;
-	}
-
-	len = read(fd, buf, size);
-	close(fd);
-	free(path);
-
-	if (len > 0 && buf[len - 1] == '\n')
-		buf[--len] = '\0';
-
-	return len;
-}
-
 int ofi_set_thread_affinity(const char *s)
 {
-#ifndef __APPLE__
-	char *saveptra = NULL, *saveptrb = NULL, *saveptrc = NULL;
-	char *dup_s, *a, *b, *c;
-	int j, first, last, stride, ret = FI_SUCCESS;
-	ofi_cpu_set_t mycpuset;
-	pthread_t mythread;
-
-	mythread = pthread_self();
-	CPU_ZERO(&mycpuset);
-
-	dup_s = strdup(s);
-	if (dup_s == NULL)
-		return -FI_ENOMEM;
-
-	a = strtok_r(dup_s, ",", &saveptra);
-	while (a) {
-		last = -1;
-		stride = 1;
-		b = strtok_r(a, "-", &saveptrb);
-		assert(b);
-		first = atoi(b);
-		/* Check for range delimiter */
-		b = strtok_r(NULL, "-", &saveptrb);
-		if (b) {
-			c = strtok_r(b, ":", &saveptrc);
-			assert(c);
-			last = atoi(c);
-			/* Check for stride */
-			c = strtok_r(NULL, ":", &saveptrc);
-			if (c)
-				stride = atoi(c);
-		}
-
-		if (last == -1)
-			last = first;
-
-		for (j = first; j <= last; j += stride)
-			CPU_SET(j, &mycpuset);
-		a =  strtok_r(NULL, ",", &saveptra);
-	}
-
-	ret = pthread_setaffinity_np(mythread, sizeof(mycpuset), &mycpuset);
-	if (ret)
-		ret = -errno;
-
-	free(dup_s);
-	return ret;
+#if HAVE_LITHE
+	/* CPU affinity is not used with Lithe - Lithe manages CPU scheduling */
+	(void)s;
+	return -FI_ENOSYS;
 #else
-	OFI_UNUSED(s);
+	/* Original implementation would go here */
+	(void)s;
 	return -FI_ENOSYS;
 #endif
 }
 
+int fi_read_file(const char *dir, const char *file, char *buf, size_t size)
+{
+	char path[PATH_MAX];
+	int len = -1;
+	FILE *fp;
+	int n;
+
+	if (snprintf(path, sizeof(path), "%s/%s", dir, file) >= (int)sizeof(path))
+		return -1;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	if (fgets(buf, size, fp)) {
+		n = strlen(buf);
+		if (n > 0 && buf[n - 1] == '\n')
+			buf[--n] = '\0';
+		len = n;
+	}
+
+	fclose(fp);
+	return len;
+}
 
 struct ofi_pollfds_ctx *ofi_pollfds_get_ctx(struct ofi_pollfds *pfds, int fd)
 {
-	struct ofi_pollfds_ctx *ctx;
+	struct ofi_pollfds_ctx *ctx = NULL;
+	int i;
 
 	assert(ofi_genlock_held(&pfds->lock));
-	if (fd < 0 || fd >= pfds->size)
-		return NULL;
 
-	ctx = &pfds->ctx[fd];
-	if (ctx->index < 0 || ctx->index >= pfds->nfds ||
-	    pfds->fds[ctx->index].fd != fd)
-		return NULL;
+	/* 0 is signaling fd */
+	for (i = 1; i < pfds->size; i++) {
+		ctx = &pfds->ctx[i];
+		if (ctx->index >= 0 && ctx->index < pfds->nfds &&
+		    pfds->fds[ctx->index].fd == fd)
+			return ctx;
+	}
 
-	return ctx;
+	return NULL;
 }
 
 struct ofi_pollfds_ctx *ofi_pollfds_alloc_ctx(struct ofi_pollfds *pfds, int fd)
 {
 	struct ofi_pollfds_ctx *ctx;
+	int i;
 
 	assert(ofi_genlock_held(&pfds->lock));
 	assert(!ofi_pollfds_get_ctx(pfds, fd));
-	if (fd >= pfds->size) {
-		if (ofi_pollfds_grow(pfds, fd))
-			return NULL;
+	/* 0 is signaling fd */
+	for (i = 1; i < pfds->size; i++) {
+		if (pfds->ctx[i].index == -1) {
+			ctx = &pfds->ctx[i];
+			goto insert;
+		}
 	}
 
-	ctx = &pfds->ctx[fd];
+	if (ofi_pollfds_grow(pfds, pfds->size + 1))
+		return NULL;
+
+	ctx = &pfds->ctx[pfds->nfds];
+insert:
 	assert(ctx->index < 0);
 	ctx->index = pfds->nfds++;
 	return ctx;
