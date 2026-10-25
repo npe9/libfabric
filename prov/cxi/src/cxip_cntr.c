@@ -639,6 +639,23 @@ static int cxip_cntr_wait(struct fid_cntr *fid_cntr, uint64_t threshold,
 	 * field.
 	 */
 	int spin_before_yield = cxip_env.cntr_spin_before_yield;
+#if HAVE_LITHE
+	/* CXIP_LITHE_NOSPIN_CNTR=1 (2026-10-24, default 0, .build_logs/despin/mpi/): under
+	 * Lithe cntr_spin_before_yield is 0, so this wait for a NIC counter threshold was a
+	 * yield loop (DESPIN_RULES Y: the waiter stays runnable and round-robins for harts
+	 * until the NIC fires). The counter has no fd to park on: after 64 polls, sleep with
+	 * backoff (20 us doubling to 1 ms) through usleep, which libfabric.so links wrapped
+	 * (build_ofi_lithe.sh -Wl,-wrap,usleep): parlib parks the context on the reactor
+	 * timer queue and frees the hart. Not reached by OMPI's mtl/ofi (no fi_cntr). */
+	static int nospin_on = -1;
+	unsigned nospin_iter = 0;
+	unsigned nospin_us = 0;
+	if (nospin_on < 0) {
+		const char *e = getenv("CXIP_LITHE_NOSPIN_CNTR");
+		nospin_on = (e && e[0] == '1') ? 1 : 0;
+	}
+	const int nospin = nospin_on && lithe_can_block();
+#endif
 	do {
 		ret = cxip_cntr_get_ct_success(cntr, &success);
 		if (ret) {
@@ -660,6 +677,14 @@ static int cxip_cntr_wait(struct fid_cntr *fid_cntr, uint64_t threshold,
 		if (ofi_adjust_timeout(endtime, &timeout))
 			return -FI_ETIMEDOUT;
 
+#if HAVE_LITHE
+		if (nospin && ++nospin_iter > 64) {
+			nospin_us = nospin_us ? nospin_us * 2 : 20;
+			if (nospin_us > 1000)
+				nospin_us = 1000;
+			usleep(nospin_us);
+		} else
+#endif
 		if (spin_before_yield == 0) {
 			cxip_yield();
 			spin_before_yield = cxip_env.cntr_spin_before_yield;
