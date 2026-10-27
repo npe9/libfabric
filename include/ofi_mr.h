@@ -578,6 +578,8 @@ struct ofi_mr_entry *ofi_mr_cache_find(struct ofi_mr_cache *cache,
 int ofi_mr_cache_reg(struct ofi_mr_cache *cache, const struct fi_mr_attr *attr,
 		     struct ofi_mr_entry **entry, uint64_t flags);
 void ofi_mr_cache_delete(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry);
+bool ofi_mr_cache_ref_fast(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry);
+void ofi_mr_cache_unref(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry);
 
 
 void ofi_memhooks_atfork_handler(void);

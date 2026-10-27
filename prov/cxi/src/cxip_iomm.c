@@ -307,6 +307,8 @@ static void cxip_iomm_set_rocr_dev_mem_only(struct cxip_domain *dom)
 /*
  * cxip_iomm_init() - Initialize domain IO memory map.
  */
+static void cxip_md_front_fini(struct cxip_domain *dom);
+
 int cxip_iomm_init(struct cxip_domain *dom)
 {
 	struct ofi_mem_monitor *memory_monitors[OFI_HMEM_MAX] = {
@@ -318,6 +320,9 @@ int cxip_iomm_init(struct cxip_domain *dom)
 	enum fi_hmem_iface iface;
 	int ret;
 	bool scalable;
+
+	ofi_spin_init(&dom->md_front_lock);
+	dom->md_front_list = NULL;
 
 	/* Check if ATS is supported */
 	if (cxip_env.ats && cxip_ats_check(dom))
@@ -395,8 +400,10 @@ void cxip_iomm_fini(struct cxip_domain *dom)
 	if (dom->scalable_iomm)
 		cxip_scalable_iomm_fini(dom);
 
-	if (!dom->scalable_iomm || dom->hmem)
+	if (!dom->scalable_iomm || dom->hmem) {
+		cxip_md_front_fini(dom);
 		ofi_mr_cache_cleanup(&dom->iomm);
+	}
 }
 
 static int cxip_map_cache(struct cxip_domain *dom, struct ofi_mr_info *info,
@@ -595,14 +602,173 @@ static int cxip_map_cache_find(struct cxip_domain *dom, struct fi_mr_attr *attr,
 	return -FI_ENODATA;
 }
 
+/* FI_CXI_LITHE_MD_FRONT (default 1 since 2026-10-27; GAPS B69). In hosted Lithe MPI every
+ * context maps its send/recv buffers through the one domain MR cache, and every
+ * ofi_mr_cache_find/delete takes the global mm_lock: with the peer CQ sweep off it was
+ * all of the remaining lock wait in a 4x4 allreduce (LITHE_LOCK_PROF). A small table per
+ * context (TLS = per Lithe context; a cooperative context never yields inside these
+ * table ops, so per-hart TLS would be safe too) holds one reference to each of the last
+ * CXIP_MD_FRONT entries it used. While that reference is held the entry cannot be freed
+ * or put on the LRU, so a hit takes and drops its own reference lock-free
+ * (ofi_mr_cache_ref_fast/unref) and only re-checks that the monitor has not invalidated
+ * it (node cleared on munmap). Only FI_HMEM_SYSTEM entries; device memory keeps the
+ * monitor->valid query. Cost: up to CXIP_MD_FRONT pinned entries per context that the
+ * LRU cannot evict. */
+#define CXIP_MD_FRONT 8
+struct cxip_md_front {
+	struct cxip_md_front *next;
+	struct cxip_domain *dom;	/* NULL once the domain is closed */
+	unsigned int victim;
+	struct {
+		struct ofi_mr_entry *e;
+		uintptr_t lo, hi;
+	} s[CXIP_MD_FRONT];
+};
+static int cxip_md_front_on = -1;
+static __thread struct cxip_md_front *cxip_md_front_tl;
+
+static inline bool cxip_md_front_enabled(void)
+{
+	if (OFI_UNLIKELY(cxip_md_front_on < 0)) {
+		const char *e = getenv("FI_CXI_LITHE_MD_FRONT");
+		/* default on since 2026-10-27 (B69); 0 = every map through mm_lock */
+		cxip_md_front_on = !(e && e[0] == '0');
+	}
+	return cxip_md_front_on;
+}
+
+static struct cxip_md_front *cxip_md_front_get(struct cxip_domain *dom, bool create)
+{
+	struct cxip_md_front *f = cxip_md_front_tl;
+
+	if (f && f->dom == dom)
+		return f;
+	if (f || !create)
+		return NULL;	/* one domain per context: others bypass */
+	f = calloc(1, sizeof(*f));
+	if (!f)
+		return NULL;
+	f->dom = dom;
+	ofi_spin_lock(&dom->md_front_lock);
+	f->next = dom->md_front_list;
+	dom->md_front_list = f;
+	ofi_spin_unlock(&dom->md_front_lock);
+	cxip_md_front_tl = f;
+	return f;
+}
+
+static bool cxip_md_front_hit(struct cxip_domain *dom, const void *buf,
+			      unsigned long len, uint64_t access,
+			      struct cxip_md **md)
+{
+	struct cxip_md_front *f = cxip_md_front_get(dom, false);
+	uintptr_t lo = (uintptr_t)buf, hi = lo + len;
+	int i;
+
+	if (!f)
+		return false;
+	for (i = 0; i < CXIP_MD_FRONT; i++) {
+		struct ofi_mr_entry *e = f->s[i].e;
+		struct cxip_md *m;
+
+		if (!e || lo < f->s[i].lo || hi > f->s[i].hi)
+			continue;
+		m = (struct cxip_md *)e->data;
+		if ((m->map_flags & access) != access)
+			continue;
+		if (ofi_mr_cache_ref_fast(&dom->iomm, e)) {
+			*md = m;
+			return true;
+		}
+		/* invalidated: drop the table's reference too */
+		f->s[i].e = NULL;
+		ofi_mr_cache_unref(&dom->iomm, e);
+		return false;
+	}
+	return false;
+}
+
+static void cxip_md_front_insert(struct cxip_domain *dom, struct cxip_md *md)
+{
+	struct ofi_mr_entry *e = container_of(md, struct ofi_mr_entry, data);
+	struct cxip_md_front *f;
+	struct ofi_mr_entry *old;
+	unsigned int v;
+	int i;
+
+	if (!md->cached || e->info.iface != FI_HMEM_SYSTEM)
+		return;
+	f = cxip_md_front_get(dom, true);
+	if (!f)
+		return;
+	for (i = 0; i < CXIP_MD_FRONT; i++)
+		if (f->s[i].e == e)
+			return;
+	if (!ofi_mr_cache_ref_fast(&dom->iomm, e))
+		return;
+	v = f->victim++ % CXIP_MD_FRONT;
+	old = f->s[v].e;
+	f->s[v].e = e;
+	f->s[v].lo = (uintptr_t)e->info.iov.iov_base;
+	f->s[v].hi = f->s[v].lo + e->info.iov.iov_len;
+	if (old)	/* after the table is consistent: this may take mm_lock */
+		ofi_mr_cache_unref(&dom->iomm, old);
+}
+
+static void cxip_md_front_fini(struct cxip_domain *dom)
+{
+	struct cxip_md_front *f;
+	int i;
+
+	ofi_spin_lock(&dom->md_front_lock);
+	for (f = dom->md_front_list; f; f = f->next) {
+		for (i = 0; i < CXIP_MD_FRONT; i++) {
+			if (f->s[i].e)
+				ofi_mr_cache_delete(&dom->iomm, f->s[i].e);
+			f->s[i].e = NULL;
+		}
+		f->dom = NULL;	/* tables are leaked on purpose: TLS may still point at them */
+	}
+	dom->md_front_list = NULL;
+	ofi_spin_unlock(&dom->md_front_lock);
+}
+
 /*
  * cxip_map() - Acquire IO mapping for buf.
  *
  * The IO memory map is searched for a IO mapping which covers buf. If no
  * mapping has been established, create one and cache it.
  */
+static int cxip_map_slow(struct cxip_domain *dom, const void *buf, unsigned long len,
+			 uint64_t access, uint64_t flags, struct cxip_md **md);
+
 int cxip_map(struct cxip_domain *dom, const void *buf, unsigned long len,
 	     uint64_t access, uint64_t flags, struct cxip_md **md)
+{
+	int ret;
+	bool cache = !(flags & OFI_MR_NOCACHE);
+
+	/* TODO: ATS (scalable MD) can only support CPU page sizes and should be
+	 * avoided for non-standard page sizes.
+	 */
+	if (dom->scalable_iomm && !dom->hmem) {
+		*md = &dom->scalable_md;
+		return FI_SUCCESS;
+	}
+
+	if (cache && cxip_md_front_enabled()) {
+		if (cxip_md_front_hit(dom, buf, len, access, md))
+			return FI_SUCCESS;
+		ret = cxip_map_slow(dom, buf, len, access, flags, md);
+		if (ret == FI_SUCCESS)
+			cxip_md_front_insert(dom, *md);
+		return ret;
+	}
+	return cxip_map_slow(dom, buf, len, access, flags, md);
+}
+
+static int cxip_map_slow(struct cxip_domain *dom, const void *buf, unsigned long len,
+			 uint64_t access, uint64_t flags, struct cxip_md **md)
 {
 	struct iovec iov = {
 		.iov_base = (void *)buf,
@@ -616,14 +782,6 @@ int cxip_map(struct cxip_domain *dom, const void *buf, unsigned long len,
 	uint64_t hmem_flags = 0;
 	int ret;
 	bool cache = !(flags & OFI_MR_NOCACHE);
-
-	/* TODO: ATS (scalable MD) can only support CPU page sizes and should be
-	 * avoided for non-standard page sizes.
-	 */
-	if (dom->scalable_iomm && !dom->hmem) {
-		*md = &dom->scalable_md;
-		return FI_SUCCESS;
-	}
 
 	/* Since the MR cache find operates on virtual addresses and all device
 	 * memory must support a unified virtual address space with system
@@ -665,7 +823,10 @@ static void cxip_unmap_cache(struct cxip_md *md)
 	struct ofi_mr_entry *entry =
 		container_of(md, struct ofi_mr_entry, data);
 
-	ofi_mr_cache_delete(&md->dom->iomm, entry);
+	if (cxip_md_front_enabled())
+		ofi_mr_cache_unref(&md->dom->iomm, entry);	/* lock-free while > 1 */
+	else
+		ofi_mr_cache_delete(&md->dom->iomm, entry);
 }
 
 static void cxip_unmap_nocache(struct cxip_md *md)

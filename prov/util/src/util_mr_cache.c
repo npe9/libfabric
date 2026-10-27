@@ -178,7 +178,7 @@ static void util_mr_uncache_entry_storage(struct ofi_mr_cache *cache,
 	struct ofi_mem_monitor *monitor = cache->monitors[iface];
 
 	ofi_rbmap_delete(&cache->tree, entry->node);
-	entry->node = NULL;
+	__atomic_store_n(&entry->node, NULL, __ATOMIC_RELEASE);
 
 	/* Some memory monitors have a subscription context per MR. These
 	 * memory monitors require ofi_monitor_unsubscribe() to be called.
@@ -195,7 +195,7 @@ static void util_mr_uncache_entry(struct ofi_mr_cache *cache,
 {
 	util_mr_uncache_entry_storage(cache, entry);
 
-	if (entry->use_cnt == 0) {
+	if (__atomic_load_n(&entry->use_cnt, __ATOMIC_ACQUIRE) == 0) {
 		dlist_remove(&entry->list_entry);
 		dlist_insert_tail(&entry->list_entry, &cache->dead_region_list);
 	} else {
@@ -308,6 +308,41 @@ bool ofi_mr_cache_flush(struct ofi_mr_cache *cache, bool flush_lru)
 	return entries_freed;
 }
 
+/* Lock-free reference ops (cxi FI_CXI_LITHE_MD_FRONT, 2026-10-27). use_cnt is only ever
+ * moved to or from 0 under mm_lock (find/search/delete, which use atomic RMWs), so a
+ * reference may be taken without the lock when the count is already >= 1 -- the entry is
+ * then off the LRU and cannot be freed -- and dropped without the lock while it stays
+ * > 1. An entry invalidated by the monitor (munmap) is uncached: node is set NULL under
+ * mm_lock but the entry lives until its last reference goes, so a holder can see that
+ * and fall back. Every 1->0 transition still takes the locked path. */
+bool ofi_mr_cache_ref_fast(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry)
+{
+	int c = __atomic_load_n(&entry->use_cnt, __ATOMIC_RELAXED);
+
+	do {
+		if (c < 1)
+			return false;
+	} while (!__atomic_compare_exchange_n(&entry->use_cnt, &c, c + 1, true,
+					      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
+	if (!__atomic_load_n(&entry->node, __ATOMIC_ACQUIRE)) {
+		ofi_mr_cache_unref(cache, entry);
+		return false;
+	}
+	return true;
+}
+
+void ofi_mr_cache_unref(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry)
+{
+	int c = __atomic_load_n(&entry->use_cnt, __ATOMIC_RELAXED);
+
+	while (c > 1) {
+		if (__atomic_compare_exchange_n(&entry->use_cnt, &c, c - 1, true,
+						__ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+			return;
+	}
+	ofi_mr_cache_delete(cache, entry);
+}
+
 void ofi_mr_cache_delete(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry)
 {
 	FI_DBG(cache->prov, FI_LOG_MR, "delete %p (len: %zu)\n",
@@ -320,7 +355,7 @@ void ofi_mr_cache_delete(struct ofi_mr_cache *cache, struct ofi_mr_entry *entry)
 #endif
 	cache->delete_cnt++;
 
-	if (--entry->use_cnt == 0) {
+	if (__atomic_sub_fetch(&entry->use_cnt, 1, __ATOMIC_ACQ_REL) == 0) {
 		if (!entry->node) {
 			cache->uncached_cnt--;
 			cache->uncached_size -= entry->info.iov.iov_len;
@@ -501,7 +536,7 @@ int ofi_mr_cache_search(struct ofi_mr_cache *cache, struct ofi_mr_info *info,
 
 hit:
 	cache->hit_cnt++;
-	if ((*entry)->use_cnt++ == 0)
+	if (__atomic_fetch_add(&(*entry)->use_cnt, 1, __ATOMIC_ACQ_REL) == 0)
 		dlist_remove_init(&(*entry)->list_entry);
 #if HAVE_LITHE
 	ofi_mm_lock_unlock();
@@ -557,7 +592,7 @@ struct ofi_mr_entry *ofi_mr_cache_find(struct ofi_mr_cache *cache,
 	if (ofi_iov_within(attr->mr_iov, &entry->info.iov) &&
 	    monitor->valid(monitor, entry->info.iov.iov_base, entry)) {
 		cache->hit_cnt++;
-		if ((entry)->use_cnt++ == 0)
+		if (__atomic_fetch_add(&(entry)->use_cnt, 1, __ATOMIC_ACQ_REL) == 0)
 			dlist_remove_init(&(entry)->list_entry);
 	} else {
 		while (entry) {

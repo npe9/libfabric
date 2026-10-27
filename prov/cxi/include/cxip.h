@@ -988,6 +988,9 @@ struct cxip_domain {
 
 	/* Translation cache */
 	struct ofi_mr_cache iomm;
+	/* FI_CXI_LITHE_MD_FRONT: per-context front tables (cxip_iomm.c) */
+	struct cxip_md_front *md_front_list;
+	ofi_spin_t md_front_lock;
 	bool odp;
 	bool ats;
 	bool hmem;
